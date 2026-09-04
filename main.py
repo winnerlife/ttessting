@@ -46,79 +46,91 @@ async def web_index(request):
 # Bot Handlers
 # ─────────────────────────────────────────────
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Sends a menu showcasing all button color styles."""
+    """Sends a menu showcasing both Toast notifications and Modal alerts."""
     keyboard = [
-        # --- Row 1: Native Bot API Colors ---
+        # --- Section 1: Disappearing Toasts (show_alert=False) ---
         [
             InlineKeyboardButton(
-                text="Confirm ✅",
-                callback_data="btn_green",
-                api_kwargs={"style": "success"}  # 🟢 Native Green
+                text="⚡ Quick Toast", 
+                callback_data="toast_quick",
+                api_kwargs={"style": "primary"}
             ),
             InlineKeyboardButton(
-                text="Delete 🗑️",
-                callback_data="btn_red",
-                api_kwargs={"style": "danger"}   # 🔴 Native Red
-            ),
-        ],
-        # --- Row 2: Native Primary & Default ---
-        [
-            InlineKeyboardButton(
-                text="Primary Action 🚀",
-                callback_data="btn_blue",
-                api_kwargs={"style": "primary"}  # 🔵 Native Blue
-            ),
-            InlineKeyboardButton(
-                text="Standard Button ⚪",
-                callback_data="btn_default"       # Default gray style
+                text="❤️ Like (+1)", 
+                callback_data="toast_like"
             ),
         ],
-        # --- Row 3: Emoji-accented buttons (for other colors) ---
+        # --- Section 2: Modal Popups (show_alert=True) ---
         [
-            InlineKeyboardButton(text="🟡 Warning", callback_data="btn_yellow"),
-            InlineKeyboardButton(text="🟣 VIP / Special", callback_data="btn_purple"),
-            InlineKeyboardButton(text="🟠 Alert", callback_data="btn_orange"),
+            InlineKeyboardButton(
+                text="⚠️ Modal Alert", 
+                callback_data="alert_warn"
+            ),
+            InlineKeyboardButton(
+                text="🗑️ Delete Confirm", 
+                callback_data="alert_delete",
+                api_kwargs={"style": "danger"}
+            ),
         ],
-        # --- Row 4: URL Button ---
+        # --- Section 3: More Toast Examples ---
         [
-            InlineKeyboardButton(text="🌐 Open GitHub", url="https://github.com")
+            InlineKeyboardButton(
+                text="✅ Copied to Clipboard", 
+                callback_data="toast_copied",
+                api_kwargs={"style": "success"}
+            ),
+            InlineKeyboardButton(
+                text="🔄 Refreshed", 
+                callback_data="toast_refresh"
+            ),
         ]
     ]
 
     reply_markup = InlineKeyboardMarkup(keyboard)
 
     await update.message.reply_text(
-        "🎨 <b>Colored Buttons Test Menu</b>\n\n"
-        "• 🟢 <b>Green (Success):</b> Confirmations / positive actions\n"
-        "• 🔴 <b>Red (Danger):</b> Deletions / warnings / cancels\n"
-        "• 🔵 <b>Blue (Primary):</b> Main recommended action\n"
-        "• ⚪ <b>Default:</b> Standard Telegram theme\n"
-        "• 🟡 🟣 🟠 <b>Emoji Accents:</b> Custom themes\n\n"
-        "<i>Tap any button to test its response:</i>",
+        "👋 <b>Notification Tester</b>\n\n"
+        "Tap the buttons below to see the difference:\n\n"
+        "• <b>Top & Bottom rows:</b> Disappearing Toast notifications <i>(fades after 1–2 sec)</i>\n"
+        "• <b>Middle row:</b> Full modal alert dialogs <i>(requires tapping OK)</i>",
         reply_markup=reply_markup,
         parse_mode="HTML"
     )
 
 
 async def button_click_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Answers button clicks and displays a notification."""
+    """Handles clicks and demonstrates show_alert=False vs show_alert=True."""
     query = update.callback_query
-    await query.answer()  # Acknowledge the click
+    data = query.data
 
-    responses = {
-        "btn_green": "✅ You clicked the GREEN (success) button!",
-        "btn_red": "🔴 You clicked the RED (danger) button!",
-        "btn_blue": "🔵 You clicked the BLUE (primary) button!",
-        "btn_default": "⚪ You clicked the DEFAULT button.",
-        "btn_yellow": "🟡 You clicked the YELLOW emoji button.",
-        "btn_purple": "🟣 You clicked the PURPLE emoji button.",
-        "btn_orange": "🟠 You clicked the ORANGE emoji button.",
-    }
+    # 1. Disappearing Toast Notifications (show_alert=False)
+    if data == "toast_quick":
+        await query.answer("⚡ This message will vanish in a second!", show_alert=False)
 
-    selected_text = responses.get(query.data, f"Clicked: {query.data}")
+    elif data == "toast_like":
+        await query.answer("❤️ Post added to your favorites!", show_alert=False)
 
-    # Show a popup alert on Telegram
-    await query.answer(text=selected_text, show_alert=True)
+    elif data == "toast_copied":
+        await query.answer("📋 Copied to clipboard!", show_alert=False)
+
+    elif data == "toast_refresh":
+        await query.answer("🔄 Feed successfully updated.", show_alert=False)
+
+    # 2. Centered Modal Alerts with "OK" button (show_alert=True)
+    elif data == "alert_warn":
+        await query.answer(
+            "⚠️ Attention Required\n\nThis is a modal alert box. It stays on screen until you tap OK.", 
+            show_alert=True
+        )
+
+    elif data == "alert_delete":
+        await query.answer(
+            "🛑 Confirm Action\n\nAre you sure you want to permanently delete this item?", 
+            show_alert=True
+        )
+
+    else:
+        await query.answer("Button tapped!", show_alert=False)
 
 
 # ─────────────────────────────────────────────
