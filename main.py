@@ -1,1740 +1,699 @@
 import os
 import re
 import signal
+import sqlite3
 import logging
 import asyncio
-from pathlib import Path
-from datetime import datetime, timezone
-
-import aiosqlite
 from aiohttp import web
-from dotenv import load_dotenv
-
-from telegram import (
-    Update,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-)
+import aiohttp
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     Application,
     CommandHandler,
+    MessageHandler,
     CallbackQueryHandler,
     ContextTypes,
-    MessageHandler,
     filters,
 )
 
-
-# ============================================================
-# CONFIGURATION
-# ============================================================
-
-load_dotenv()
-
+# ─────────────────────────────────────────────
+# Configuration & Constants
+# ─────────────────────────────────────────────
 BOT_TOKEN = os.environ.get("TELEGRAM_TOKEN")
-OWNER_ID = int(os.environ.get("OWNER_ID", "7429996344"))
 PORT = int(os.environ.get("PORT", "8080"))
+APP_URL = os.environ.get("APP_URL")  # Optional: Your public EthioDeploy domain
 
-BASE_DIR = Path(__file__).resolve().parent
-DATA_DIR = BASE_DIR / "data"
+ADMIN_ID = int(os.environ.get("ADMIN_ID", "7429996344"))
 
-DATABASE_PATH = DATA_DIR / "bot.db"
-PROCESSED_SONGS_FILE = DATA_DIR / "processed_songs.txt"
+def format_tg_id(raw_id: str | int) -> int:
+    """Ensures supergroups and channels have the required -100 prefix."""
+    val = int(raw_id)
+    if val < 0 and not str(val).startswith("-100"):
+        return int(f"-100{abs(val)}")
+    return val
 
-DATA_DIR.mkdir(exist_ok=True)
+RECORDING_GROUP_ID = format_tg_id(os.environ.get("RECORDING_GROUP_ID", "-5309919588"))
+MUSIC_CHANNEL_ID = format_tg_id(os.environ.get("MUSIC_CHANNEL_ID", "-4448938519"))
 
-
-# ============================================================
-# LOGGING
-# ============================================================
+DB_PATH = "music_bot.db"
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
 )
-
 logger = logging.getLogger(__name__)
 
+# State tracking for ongoing broadcasts
+BROADCAST_ACTIVE = False
 
-# ============================================================
-# WEB PAGE
-# ============================================================
 
-HTML_PAGE = """<!DOCTYPE html>
+# ─────────────────────────────────────────────
+# Database Layer (SQLite with WAL mode)
+# ─────────────────────────────────────────────
+def get_db():
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL;")
+    return conn
+
+def init_db():
+    with get_db() as conn:
+        conn.executescript("""
+        CREATE TABLE IF NOT EXISTS batches (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            genre TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'recording', -- 'recording', 'publishing', 'completed', 'stopped'
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE TABLE IF NOT EXISTS songs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            batch_id INTEGER,
+            file_id TEXT NOT NULL,
+            file_unique_id TEXT NOT NULL,
+            artist TEXT,
+            title TEXT,
+            album TEXT,
+            duration INTEGER,
+            norm_key TEXT,
+            status TEXT NOT NULL DEFAULT 'queued', -- 'queued', 'duplicate_pending', 'skipped', 'published'
+            order_index INTEGER,
+            channel_message_id INTEGER,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY(batch_id) REFERENCES batches(id)
+        );
+
+        CREATE TABLE IF NOT EXISTS user_playlists (
+            user_id INTEGER NOT NULL,
+            song_id INTEGER NOT NULL,
+            added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (user_id, song_id),
+            FOREIGN KEY(song_id) REFERENCES songs(id)
+        );
+        """)
+    logger.info("✅ Database initialized successfully.")
+
+
+# ─────────────────────────────────────────────
+# Helper Functions
+# ─────────────────────────────────────────────
+def normalize_key(artist: str | None, title: str | None) -> str:
+    """Generates a clean, alphanumeric string for deduplication."""
+    text = f"{artist or ''}_{title or ''}".lower()
+    return re.sub(r"[^a-z0-9]", "", text)
+
+def make_hashtag(val: str | None) -> str:
+    if not val:
+        return ""
+    clean = re.sub(r"[^a-zA-Z0-9]", "", val.title())
+    return f"#{clean}" if clean else ""
+
+def format_duration(seconds: int | None) -> str:
+    if not seconds:
+        return "Unknown"
+    mins, secs = divmod(seconds, 60)
+    return f"{mins}:{secs:02d}"
+
+def generate_caption(artist: str | None, title: str | None, album: str | None, duration: int | None, genre: str) -> str:
+    art = artist or "Unknown Artist"
+    tit = title or "Unknown Track"
+    
+    caption = (
+        f"🎵 <b>Track:</b> {tit}\n"
+        f"👤 <b>Artist:</b> {art}\n"
+    )
+    if album:
+        caption += f"💿 <b>Album:</b> {album}\n"
+    caption += f"⏱ <b>Duration:</b> {format_duration(duration)}\n\n"
+
+    tags = [make_hashtag(genre), make_hashtag(art)]
+    if album:
+        tags.append(make_hashtag(album))
+    tags.append("#Music")
+    
+    caption += " ".join([t for t in tags if t])
+    return caption
+
+
+# ─────────────────────────────────────────────
+# Dynamic Web Dashboard for EthioDeploy / Health Check
+# ─────────────────────────────────────────────
+async def web_index(request):
+    """Renders a live dark-mode status page with current database stats."""
+    with get_db() as conn:
+        active_batch = conn.execute("SELECT id, genre FROM batches WHERE status = 'recording'").fetchone()
+        total_songs = conn.execute("SELECT COUNT(*) as c FROM songs").fetchone()["c"]
+        published = conn.execute("SELECT COUNT(*) as c FROM songs WHERE status = 'published'").fetchone()["c"]
+
+    batch_str = f"Batch #{active_batch['id']} ({active_batch['genre']})" if active_batch else "None (Idle)"
+    broadcast_badge = "🟢 Broadcasting" if BROADCAST_ACTIVE else "⚪ Idle"
+
+    html = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Music Bot</title>
-
+    <meta name="viewport" content="width=device-width,initial-scale=1">
+    <title>Music Bot Status</title>
     <style>
-        body {
-            background: #0f172a;
-            color: #4ade80;
-            font-family: Arial, sans-serif;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            height: 100vh;
-            margin: 0;
-        }
-
-        .container {
-            text-align: center;
-        }
-
-        h1 {
-            margin-bottom: 10px;
-        }
-
-        p {
-            color: #94a3b8;
-        }
+        body {{ background:#0f172a; color:#e2e8f0; font-family:system-ui,sans-serif; display:flex; align-items:center; justify-content:center; height:100vh; margin:0; }}
+        .card {{ background:#1e293b; padding:40px; border-radius:16px; text-align:center; box-shadow:0 20px 40px rgba(0,0,0,.5); max-width:440px; border-top:4px solid #38bdf8; }}
+        h1 {{ color:#38bdf8; margin:0 0 10px; font-size:1.6rem; }}
+        .status {{ color:#4ade80; font-weight:700; margin:14px 0; display:inline-flex; align-items:center; gap:8px; font-size:1.05em; }}
+        .dot {{ width:10px; height:10px; background-color:#4ade80; border-radius:50%; box-shadow:0 0 8px #4ade80; }}
+        p {{ color:#94a3b8; line-height:1.6; margin-bottom:20px; font-size:0.95em; }}
+        .stats {{ display:grid; grid-template-columns:1fr 1fr; gap:10px; margin-bottom:20px; }}
+        .stat-box {{ background:#334155; padding:12px; border-radius:10px; text-align:center; }}
+        .stat-val {{ font-size:1.3em; font-weight:bold; color:#f8fafc; }}
+        .stat-lbl {{ font-size:0.8em; color:#94a3b8; }}
+        .tag {{ display:inline-block; background:#1e1b4b; color:#c7d2fe; padding:6px 14px; border-radius:20px; font-size:0.85em; font-weight:600; }}
     </style>
 </head>
-
 <body>
-    <div class="container">
-        <h1>🤖 Music Bot is online</h1>
-        <p>Telegram service is running.</p>
+    <div class="card">
+        <h1>🎧 Music Service Bot</h1>
+        <div class="status"><div class="dot"></div> Online & Polling Telegram</div>
+        <p>Zero-download music management, deduplication pipeline, and automated channel broadcast engine.</p>
+        
+        <div class="stats">
+            <div class="stat-box">
+                <div class="stat-val">{total_songs}</div>
+                <div class="stat-lbl">Songs Tracked</div>
+            </div>
+            <div class="stat-box">
+                <div class="stat-val">{published}</div>
+                <div class="stat-lbl">Published Tracks</div>
+            </div>
+        </div>
+
+        <div class="tag">Active Batch: {batch_str}</div>
+        <div class="tag" style="margin-top:8px;background:#334155;color:#f1f5f9;">Queue: {broadcast_badge}</div>
     </div>
 </body>
-</html>
-"""
-
-
-async def web_index(request):
-    return web.Response(
-        text=HTML_PAGE,
-        content_type="text/html",
-    )
-
-
-async def web_health(request):
-    return web.json_response({
-        "status": "ok",
-        "service": "music-bot",
-    })
-
-
-# ============================================================
-# DATABASE
-# ============================================================
-
-async def init_database():
-
-    async with aiosqlite.connect(DATABASE_PATH) as db:
-
-        # ----------------------------------------------------
-        # Settings
-        # ----------------------------------------------------
-
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS settings (
-                key TEXT PRIMARY KEY,
-                value TEXT NOT NULL
-            )
-        """)
-
-        # ----------------------------------------------------
-        # Recording batches
-        # ----------------------------------------------------
-
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS batches (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                genre TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'recording',
-                created_at TEXT NOT NULL,
-                completed_at TEXT
-            )
-        """)
-
-        # ----------------------------------------------------
-        # Songs
-        # ----------------------------------------------------
-
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS songs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-
-                title TEXT NOT NULL,
-                artist TEXT,
-                album TEXT,
-                genre TEXT NOT NULL,
-
-                normalized_key TEXT NOT NULL,
-
-                telegram_file_id TEXT,
-                telegram_file_unique_id TEXT,
-
-                source_chat_id INTEGER NOT NULL,
-                source_message_id INTEGER NOT NULL,
-
-                duration INTEGER,
-
-                status TEXT NOT NULL DEFAULT 'recorded',
-
-                created_at TEXT NOT NULL
-            )
-        """)
-
-        # ----------------------------------------------------
-        # Songs belonging to batches
-        # ----------------------------------------------------
-
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS batch_songs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-
-                batch_id INTEGER NOT NULL,
-                song_id INTEGER NOT NULL,
-
-                position INTEGER NOT NULL,
-
-                FOREIGN KEY(batch_id)
-                    REFERENCES batches(id),
-
-                FOREIGN KEY(song_id)
-                    REFERENCES songs(id)
-            )
-        """)
-
-        # ----------------------------------------------------
-        # Playlist
-        # We'll use this later.
-        # ----------------------------------------------------
-
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS playlist_items (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-
-                telegram_user_id INTEGER NOT NULL,
-                song_id INTEGER NOT NULL,
-
-                added_at TEXT NOT NULL,
-
-                UNIQUE(
-                    telegram_user_id,
-                    song_id
-                ),
-
-                FOREIGN KEY(song_id)
-                    REFERENCES songs(id)
-            )
-        """)
-
-        # ----------------------------------------------------
-        # Pending duplicate decisions
-        # ----------------------------------------------------
-
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS pending_duplicates (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-
-                batch_id INTEGER NOT NULL,
-                song_id INTEGER NOT NULL,
-
-                created_at TEXT NOT NULL,
-
-                FOREIGN KEY(batch_id)
-                    REFERENCES batches(id),
-
-                FOREIGN KEY(song_id)
-                    REFERENCES songs(id)
-            )
-        """)
-
-        await db.commit()
-
-    logger.info("Database initialized.")
-
-
-# ============================================================
-# DATABASE HELPERS
-# ============================================================
-
-async def get_setting(key: str):
-
-    async with aiosqlite.connect(DATABASE_PATH) as db:
-
-        cursor = await db.execute(
-            "SELECT value FROM settings WHERE key = ?",
-            (key,),
-        )
-
-        row = await cursor.fetchone()
-
-        return row[0] if row else None
-
-
-async def set_setting(key: str, value: str):
-
-    async with aiosqlite.connect(DATABASE_PATH) as db:
-
-        await db.execute(
-            """
-            INSERT INTO settings(key, value)
-            VALUES (?, ?)
-
-            ON CONFLICT(key)
-            DO UPDATE SET value = excluded.value
-            """,
-            (key, value),
-        )
-
-        await db.commit()
-
-
-async def get_active_batch():
-
-    async with aiosqlite.connect(DATABASE_PATH) as db:
-
-        cursor = await db.execute(
-            """
-            SELECT id, genre, created_at
-            FROM batches
-            WHERE status = 'recording'
-            ORDER BY id DESC
-            LIMIT 1
-            """
-        )
-
-        return await cursor.fetchone()
-
-
-async def get_batch_count(batch_id: int):
-
-    async with aiosqlite.connect(DATABASE_PATH) as db:
-
-        cursor = await db.execute(
-            """
-            SELECT COUNT(*)
-            FROM batch_songs
-            WHERE batch_id = ?
-            """,
-            (batch_id,),
-        )
-
-        row = await cursor.fetchone()
-
-        return row[0]
-
-
-async def get_next_position(batch_id: int):
-
-    async with aiosqlite.connect(DATABASE_PATH) as db:
-
-        cursor = await db.execute(
-            """
-            SELECT COALESCE(MAX(position), 0)
-            FROM batch_songs
-            WHERE batch_id = ?
-            """,
-            (batch_id,),
-        )
-
-        row = await cursor.fetchone()
-
-        return row[0] + 1
-
-
-# ============================================================
-# HELPERS
-# ============================================================
-
-def is_owner(update: Update) -> bool:
-
-    user = update.effective_user
-
-    return bool(
-        user and user.id == OWNER_ID
-    )
-
-
-async def require_owner(update: Update) -> bool:
-
-    if is_owner(update):
-        return True
-
-    if update.effective_message:
-
-        await update.effective_message.reply_text(
-            "❌ You are not authorized to use this command."
-        )
-
-    return False
-
-
-def now_iso():
-
-    return datetime.now(
-        timezone.utc
-    ).isoformat()
-
-
-def clean_text(value):
-
-    if not value:
-        return ""
-
-    value = value.strip()
-
-    value = re.sub(
-        r"\s+",
-        " ",
-        value,
-    )
-
-    return value
-
-
-def normalize_song_part(value):
-
-    if not value:
-        return ""
-
-    value = value.lower()
-
-    value = value.replace(
-        "—",
-        "-"
-    )
-
-    value = value.replace(
-        "–",
-        "-"
-    )
-
-    # Remove punctuation.
-    value = re.sub(
-        r"[^\w\s]",
-        " ",
-        value,
-        flags=re.UNICODE,
-    )
-
-    # Collapse whitespace.
-    value = re.sub(
-        r"\s+",
-        " ",
-        value,
-    )
-
-    return value.strip()
-
-
-def make_duplicate_key(
-    artist: str,
-    title: str,
-):
-
-    artist_part = normalize_song_part(
-        artist
-    )
-
-    title_part = normalize_song_part(
-        title
-    )
-
-    return f"{artist_part}|{title_part}"
-
-
-def display_song(
-    artist: str,
-    title: str,
-):
-
-    artist = clean_text(artist)
-    title = clean_text(title)
-
-    if artist and title:
-        return f"{artist} — {title}"
-
-    if title:
-        return title
-
-    return "Unknown song"
-
-
-def extract_genre(command_args):
-
-    if not command_args:
-        return None
-
-    genre = " ".join(command_args).strip()
-
-    # Remove one surrounding pair of quotes.
-    if len(genre) >= 2:
-
-        if (
-            genre.startswith('"')
-            and genre.endswith('"')
-        ):
-            genre = genre[1:-1]
-
-        elif (
-            genre.startswith("'")
-            and genre.endswith("'")
-        ):
-            genre = genre[1:-1]
-
-    genre = clean_text(genre)
-
-    return genre if genre else None
-
-
-# ============================================================
-# PROCESSED SONGS FILE
-# ============================================================
-
-def append_processed_song(
-    artist,
-    title,
-    album,
-    genre,
-):
-
-    line = (
-        f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-        f" | {genre}"
-        f" | {artist or 'Unknown Artist'}"
-        f" | {title or 'Unknown Title'}"
-        f" | {album or 'Unknown Album'}\n"
-    )
-
-    with open(
-        PROCESSED_SONGS_FILE,
-        "a",
-        encoding="utf-8",
-    ) as file:
-
-        file.write(line)
-
-
-# ============================================================
-# /START
-# ============================================================
-
-async def start_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-
-    await update.effective_message.reply_text(
-        "🎵 <b>Music Bot</b>\n\n"
-        "Bot is online.\n\n"
-
-        "<b>Configuration</b>\n"
-        "/setgroupid\n"
-        "/setchannelid -100xxxxxxxxxx\n"
-        "/status\n\n"
-
-        "<b>Recording</b>\n"
-        '/record "genre"\n'
-        "/over\n\n"
-
-        "Example:\n"
-        '/record "rnb"',
-        parse_mode="HTML",
-    )
-
-
-# ============================================================
-# /SETGROUPID
-# ============================================================
-
-async def set_group_id_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-
-    if not await require_owner(update):
+</html>"""
+    return web.Response(text=html, content_type="text/html")
+
+
+# ─────────────────────────────────────────────
+# Web Service Self-Ping (Prevents Instance Sleep)
+# ─────────────────────────────────────────────
+async def keep_alive_pinger():
+    """Periodically pings the local web service every 10 minutes to prevent container sleep."""
+    await asyncio.sleep(15)  # Wait for web service startup
+    target_url = APP_URL or f"http://127.0.0.1:{PORT}/"
+    logger.info(f"🔄 Keep-alive pinger started. Polling: {target_url}")
+
+    async with aiohttp.ClientSession() as session:
+        while True:
+            try:
+                async with session.get(target_url, timeout=10) as resp:
+                    logger.info(f"💓 Keep-alive ping sent (HTTP {resp.status})")
+            except Exception as e:
+                logger.warning(f"⚠️ Keep-alive ping notice: {e}")
+            await asyncio.sleep(600)  # Ping every 10 minutes
+
+
+# ─────────────────────────────────────────────
+# Admin Commands: /record, /over, /stopbroadcast, /status
+# ─────────────────────────────────────────────
+async def record_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Starts a new recording batch for a specified genre."""
+    if update.effective_user.id != ADMIN_ID:
         return
 
-    message = update.effective_message
-    chat = update.effective_chat
+    args = context.args
+    if not args:
+        await update.message.reply_text("⚠️ Please specify a genre. Example:\n<code>/record rnb</code>", parse_mode="HTML")
+        return
 
-    # --------------------------------------------------------
-    # Explicit ID
-    # --------------------------------------------------------
+    genre = " ".join(args).replace('"', '').strip()
 
-    if context.args:
-
-        group_id = context.args[0].strip()
-
-        try:
-            int(group_id)
-
-        except ValueError:
-
-            await message.reply_text(
-                "❌ Invalid group ID.\n\n"
-                "Example:\n"
-                "<code>/setgroupid -100123456789</code>",
-                parse_mode="HTML",
+    with get_db() as conn:
+        active = conn.execute("SELECT id, genre FROM batches WHERE status = 'recording'").fetchone()
+        if active:
+            await update.message.reply_text(
+                f"⚠️ Batch #{active['id']} (<b>{active['genre']}</b>) is currently recording.\n"
+                f"Send <code>/over</code> to finish it first.",
+                parse_mode="HTML"
             )
-
             return
 
-        await set_setting(
-            "group_id",
-            group_id,
-        )
+        cur = conn.execute("INSERT INTO batches (genre, status) VALUES (?, 'recording')", (genre,))
+        batch_id = cur.lastrowid
 
-        await message.reply_text(
-            "✅ Recording group updated.\n\n"
-            f"Group ID: <code>{group_id}</code>",
-            parse_mode="HTML",
-        )
-
-        return
-
-    # --------------------------------------------------------
-    # Use current group
-    # --------------------------------------------------------
-
-    if chat.type not in (
-        "group",
-        "supergroup",
-    ):
-
-        await message.reply_text(
-            "❌ Use this command inside the recording group.\n\n"
-            "Or provide the ID manually:\n"
-            "<code>/setgroupid -100123456789</code>",
-            parse_mode="HTML",
-        )
-
-        return
-
-    group_id = str(chat.id)
-
-    await set_setting(
-        "group_id",
-        group_id,
+    await update.message.reply_text(
+        f"🎙️ <b>Recording Session #{batch_id} Started!</b>\n"
+        f"• <b>Genre:</b> #{make_hashtag(genre)[1:]}\n\n"
+        f"👉 Forward songs into this group now.\n"
+        f"👉 Send <code>/over</code> when finished to begin automated channel publishing.",
+        parse_mode="HTML"
     )
 
-    await message.reply_text(
-        "✅ This group is now the recording group.\n\n"
-        f"Group ID: <code>{group_id}</code>",
-        parse_mode="HTML",
-    )
-
-
-# ============================================================
-# /SETCHANNELID
-# ============================================================
-
-async def set_channel_id_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-
-    if not await require_owner(update):
+async def over_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Closes the recording session and starts publishing to the channel."""
+    global BROADCAST_ACTIVE
+    if update.effective_user.id != ADMIN_ID:
         return
 
-    message = update.effective_message
+    with get_db() as conn:
+        batch = conn.execute("SELECT id, genre FROM batches WHERE status = 'recording'").fetchone()
+        if not batch:
+            await update.message.reply_text("ℹ️ No active recording session found.")
+            return
 
-    if not context.args:
+        batch_id = batch["id"]
+        genre = batch["genre"]
 
-        await message.reply_text(
-            "❌ Please provide the channel ID.\n\n"
-            "Example:\n"
-            "<code>/setchannelid -100123456789</code>",
-            parse_mode="HTML",
-        )
+        queued_count = conn.execute("SELECT COUNT(*) as c FROM songs WHERE batch_id = ? AND status = 'queued'", (batch_id,)).fetchone()["c"]
+        pending_count = conn.execute("SELECT COUNT(*) as c FROM songs WHERE batch_id = ? AND status = 'duplicate_pending'", (batch_id,)).fetchone()["c"]
 
+        conn.execute("UPDATE batches SET status = 'publishing' WHERE id = ?", (batch_id,))
+
+    await update.message.reply_text(
+        f"🏁 <b>Recording Session #{batch_id} Closed</b>\n"
+        f"• <b>Queued songs:</b> {queued_count}\n"
+        f"• <b>Pending duplicates:</b> {pending_count}\n\n"
+        f"🚀 <b>Starting automatic broadcast to channel...</b>\n"
+        f"<i>(Send <code>/stopbroadcast</code> at any time to pause)</i>",
+        parse_mode="HTML"
+    )
+
+    BROADCAST_ACTIVE = True
+    asyncio.create_task(broadcast_worker(context.application, batch_id, genre))
+
+async def stopbroadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Stops the active channel broadcast."""
+    global BROADCAST_ACTIVE
+    if update.effective_user.id != ADMIN_ID:
         return
 
-    channel_id = context.args[0].strip()
-
-    try:
-        int(channel_id)
-
-    except ValueError:
-
-        await message.reply_text(
-            "❌ Invalid channel ID.",
-        )
-
+    if not BROADCAST_ACTIVE:
+        await update.message.reply_text("ℹ️ There is no broadcast running right now.")
         return
 
-    await set_setting(
-        "channel_id",
-        channel_id,
-    )
+    BROADCAST_ACTIVE = False
+    await update.message.reply_text("🛑 <b>Broadcast stopping...</b> Remaining tracks remain queued.", parse_mode="HTML")
 
-    await message.reply_text(
-        "✅ Music channel updated.\n\n"
-        f"Channel ID: <code>{channel_id}</code>",
-        parse_mode="HTML",
-    )
-
-
-# ============================================================
-# /STATUS
-# ============================================================
-
-async def status_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-
-    if not await require_owner(update):
+async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Displays current system and batch information."""
+    if update.effective_user.id != ADMIN_ID:
         return
 
-    group_id = await get_setting(
-        "group_id"
+    with get_db() as conn:
+        active_rec = conn.execute("SELECT * FROM batches WHERE status = 'recording'").fetchone()
+        total_songs = conn.execute("SELECT COUNT(*) as c FROM songs").fetchone()["c"]
+        published_songs = conn.execute("SELECT COUNT(*) as c FROM songs WHERE status = 'published'").fetchone()["c"]
+
+    status_msg = (
+        f"⚙️ <b>Bot System Status</b>\n\n"
+        f"• <b>Active Broadcast:</b> {'🟢 Running' if BROADCAST_ACTIVE else '⚪ Idle'}\n"
+        f"• <b>Recording Group:</b> <code>{RECORDING_GROUP_ID}</code>\n"
+        f"• <b>Music Channel:</b> <code>{MUSIC_CHANNEL_ID}</code>\n"
+        f"• <b>Total Songs in DB:</b> {total_songs}\n"
+        f"• <b>Total Published:</b> {published_songs}\n\n"
     )
 
-    channel_id = await get_setting(
-        "channel_id"
-    )
-
-    active_batch = await get_active_batch()
-
-    if active_batch:
-
-        batch_id = active_batch[0]
-        genre = active_batch[1]
-
-        song_count = await get_batch_count(
-            batch_id
-        )
-
-        recording_status = (
-            f"🟢 Recording\n"
-            f"Batch: #{batch_id}\n"
-            f"Genre: {genre}\n"
-            f"Songs: {song_count}"
-        )
-
+    if active_rec:
+        status_msg += f"🎙️ <b>Active Batch:</b> #{active_rec['id']} (Genre: {active_rec['genre']})"
     else:
+        status_msg += "🎙️ <b>Active Batch:</b> None (Use /record <genre>)"
 
-        recording_status = "⚪ Not recording"
-
-    await update.effective_message.reply_text(
-        "⚙️ <b>Bot Status</b>\n\n"
-
-        f"📥 <b>Recording Group</b>\n"
-        f"<code>{group_id or 'Not configured'}</code>\n\n"
-
-        f"📢 <b>Music Channel</b>\n"
-        f"<code>{channel_id or 'Not configured'}</code>\n\n"
-
-        f"🎙️ <b>Recorder</b>\n"
-        f"{recording_status}",
-        parse_mode="HTML",
-    )
+    await update.message.reply_text(status_msg, parse_mode="HTML")
 
 
-# ============================================================
-# /RECORD
-# ============================================================
-
-async def record_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-
-    if not await require_owner(update):
+# ─────────────────────────────────────────────
+# Audio Ingestion & Duplicate Handling
+# ─────────────────────────────────────────────
+async def handle_audio_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Listens for forwarded audio in the recording group."""
+    msg = update.message
+    if not msg or not msg.audio:
         return
 
-    message = update.effective_message
-
-    genre = extract_genre(
-        context.args
-    )
-
-    if not genre:
-
-        await message.reply_text(
-            '❌ Please specify a genre.\n\n'
-            'Example:\n'
-            '/record "rnb"',
-        )
-
+    if msg.chat_id != RECORDING_GROUP_ID:
         return
 
-    group_id = await get_setting(
-        "group_id"
-    )
-
-    if not group_id:
-
-        await message.reply_text(
-            "❌ No recording group has been configured.\n\n"
-            "Use /setgroupid first.",
-        )
-
-        return
-
-    active_batch = await get_active_batch()
-
-    if active_batch:
-
-        await message.reply_text(
-            "⚠️ A recording session is already active.\n\n"
-            f"Batch: #{active_batch[0]}\n"
-            f"Genre: {active_batch[1]}\n\n"
-            "Use /over before starting another one.",
-        )
-
-        return
-
-    created_at = now_iso()
-
-    async with aiosqlite.connect(
-        DATABASE_PATH
-    ) as db:
-
-        cursor = await db.execute(
-            """
-            INSERT INTO batches(
-                genre,
-                status,
-                created_at
-            )
-            VALUES (?, 'recording', ?)
-            """,
-            (
-                genre,
-                created_at,
-            ),
-        )
-
-        batch_id = cursor.lastrowid
-
-        await db.commit()
-
-    await message.reply_text(
-        "🔴 <b>Recording started</b>\n\n"
-        f"Genre: <b>{genre}</b>\n"
-        f"Batch: <code>#{batch_id}</code>\n\n"
-
-        "Send/forward the songs into the recording group.\n"
-        "Captions will be ignored.\n\n"
-
-        "When you're finished:\n"
-        "/over",
-        parse_mode="HTML",
-    )
-
-    logger.info(
-        "Recording started: batch=%s genre=%s",
-        batch_id,
-        genre,
-    )
-
-
-# ============================================================
-# /OVER
-# ============================================================
-
-async def over_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-
-    if not await require_owner(update):
-        return
-
-    message = update.effective_message
-
-    active_batch = await get_active_batch()
-
-    if not active_batch:
-
-        await message.reply_text(
-            "⚪ There is no active recording session.",
-        )
-
-        return
-
-    batch_id = active_batch[0]
-    genre = active_batch[1]
-
-    song_count = await get_batch_count(
-        batch_id
-    )
-
-    completed_at = now_iso()
-
-    async with aiosqlite.connect(
-        DATABASE_PATH
-    ) as db:
-
-        await db.execute(
-            """
-            UPDATE batches
-            SET
-                status = 'queued',
-                completed_at = ?
-            WHERE id = ?
-            """,
-            (
-                completed_at,
-                batch_id,
-            ),
-        )
-
-        await db.commit()
-
-    await message.reply_text(
-        "✅ <b>Recording complete</b>\n\n"
-
-        f"Batch: <code>#{batch_id}</code>\n"
-        f"Genre: <b>{genre}</b>\n"
-        f"Songs recorded: <b>{song_count}</b>\n\n"
-
-        "The batch is now queued for publishing.",
-        parse_mode="HTML",
-    )
-
-    logger.info(
-        "Recording finished: batch=%s songs=%s",
-        batch_id,
-        song_count,
-    )
-
-
-# ============================================================
-# AUDIO MESSAGE HANDLER
-# ============================================================
-
-async def audio_message_handler(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-
-    message = update.effective_message
-
-    if not message:
-        return
-
-    # --------------------------------------------------------
-    # Only process messages from configured group.
-    # --------------------------------------------------------
-
-    group_id = await get_setting(
-        "group_id"
-    )
-
-    if not group_id:
-        return
-
-    try:
-        configured_group_id = int(
-            group_id
-        )
-
-    except ValueError:
-        return
-
-    if message.chat_id != configured_group_id:
-        return
-
-    # --------------------------------------------------------
-    # Check whether recording is active.
-    # --------------------------------------------------------
-
-    active_batch = await get_active_batch()
-
-    if not active_batch:
-        return
-
-    batch_id = active_batch[0]
-    genre = active_batch[1]
-
-    # --------------------------------------------------------
-    # Make sure this is actually audio.
-    # --------------------------------------------------------
-
-    audio = message.audio
-
-    if not audio:
-        return
-
-    # --------------------------------------------------------
-    # Extract metadata.
-    # --------------------------------------------------------
-
-    title = clean_text(
-        audio.title
-    )
-
-    artist = clean_text(
-        audio.performer
-    )
-
-    album = clean_text(
-        audio.album
-    )
-
+    audio = msg.audio
+    artist = audio.performer
+    title = audio.title or audio.file_name or "Unknown Track"
+    album = None
     duration = audio.duration
-
     file_id = audio.file_id
     file_unique_id = audio.file_unique_id
 
-    # Some Telegram audio messages may have no title.
-    if not title:
+    with get_db() as conn:
+        batch = conn.execute("SELECT id FROM batches WHERE status = 'recording'").fetchone()
+        if not batch:
+            return
 
-        if audio.file_name:
-            title = clean_text(
-                Path(audio.file_name).stem
+        batch_id = batch["id"]
+        norm = normalize_key(artist, title)
+
+        # Check for duplicates across all previous batches
+        existing = conn.execute(
+            "SELECT id, artist, title FROM songs WHERE norm_key = ? AND status != 'skipped'",
+            (norm,)
+        ).fetchone()
+
+        order_row = conn.execute(
+            "SELECT MAX(order_index) as max_order FROM songs WHERE batch_id = ?",
+            (batch_id,)
+        ).fetchone()
+        next_order = (order_row["max_order"] or 0) + 1
+
+        if existing:
+            cur = conn.execute(
+                """INSERT INTO songs (batch_id, file_id, file_unique_id, artist, title, album, duration, norm_key, status, order_index)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'duplicate_pending', ?)""",
+                (batch_id, file_id, file_unique_id, artist, title, album, duration, norm, next_order)
             )
+            song_id = cur.lastrowid
 
+            buttons = [
+                [
+                    InlineKeyboardButton("🚫 Skip", callback_data=f"dup_skip_{song_id}", api_kwargs={"style": "danger"}),
+                    InlineKeyboardButton("⚠️ Record Anyway", callback_data=f"dup_keep_{song_id}", api_kwargs={"style": "primary"}),
+                ]
+            ]
+            await msg.reply_text(
+                f"⚠️ <b>Duplicate Detected</b>\n"
+                f"🎵 <b>{artist} - {title}</b> matches an existing song in the database.\n"
+                f"What would you like to do?",
+                reply_markup=InlineKeyboardMarkup(buttons),
+                parse_mode="HTML"
+            )
         else:
-            title = "Unknown Title"
-
-    duplicate_key = make_duplicate_key(
-        artist,
-        title,
-    )
-
-    # --------------------------------------------------------
-    # Check for duplicate.
-    # --------------------------------------------------------
-
-    async with aiosqlite.connect(
-        DATABASE_PATH
-    ) as db:
-
-        cursor = await db.execute(
-            """
-            SELECT
-                id,
-                artist,
-                title,
-                album,
-                genre,
-                created_at
-            FROM songs
-            WHERE normalized_key = ?
-            AND status IN ('recorded', 'duplicate_recorded')
-            ORDER BY id ASC
-            LIMIT 1
-            """,
-            (
-                duplicate_key,
-            ),
-        )
-
-        existing_song = await cursor.fetchone()
-
-    # --------------------------------------------------------
-    # Duplicate detected.
-    # --------------------------------------------------------
-
-    if existing_song:
-
-        async with aiosqlite.connect(
-            DATABASE_PATH
-        ) as db:
-
-            cursor = await db.execute(
-                """
-                INSERT INTO songs(
-                    title,
-                    artist,
-                    album,
-                    genre,
-                    normalized_key,
-                    telegram_file_id,
-                    telegram_file_unique_id,
-                    source_chat_id,
-                    source_message_id,
-                    duration,
-                    status,
-                    created_at
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    title,
-                    artist or None,
-                    album or None,
-                    genre,
-                    duplicate_key,
-                    file_id,
-                    file_unique_id,
-                    message.chat_id,
-                    message.message_id,
-                    duration,
-                    "duplicate_pending",
-                    now_iso(),
-                ),
+            conn.execute(
+                """INSERT INTO songs (batch_id, file_id, file_unique_id, artist, title, album, duration, norm_key, status, order_index)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?)""",
+                (batch_id, file_id, file_unique_id, artist, title, album, duration, norm, next_order)
             )
 
-            pending_song_id = cursor.lastrowid
 
-            await db.execute(
-                """
-                INSERT INTO pending_duplicates(
-                    batch_id,
-                    song_id,
-                    created_at
-                )
-                VALUES (?, ?, ?)
-                """,
-                (
-                    batch_id,
-                    pending_song_id,
-                    now_iso(),
-                ),
-            )
+async def duplicate_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Resolves duplicate review button clicks."""
+    query = update.callback_query
+    if query.from_user.id != ADMIN_ID:
+        await query.answer("Admin only.", show_alert=True)
+        return
 
-            await db.commit()
+    data = query.data
+    action, song_id_str = data.rsplit("_", 1)
+    song_id = int(song_id_str)
 
-        existing_display = display_song(
-            existing_song[1],
-            existing_song[2],
+    with get_db() as conn:
+        if action == "dup_skip":
+            conn.execute("UPDATE songs SET status = 'skipped' WHERE id = ?", (song_id,))
+            await query.answer("Track skipped.")
+            await query.edit_message_text("🚫 <b>Track Skipped.</b>", parse_mode="HTML")
+        elif action == "dup_keep":
+            conn.execute("UPDATE songs SET status = 'queued' WHERE id = ?", (song_id,))
+            await query.answer("Track queued for publishing.")
+            await query.edit_message_text("✅ <b>Track Kept and Queued.</b>", parse_mode="HTML")
+
+
+# ─────────────────────────────────────────────
+# Automated Channel Publishing Queue
+# ─────────────────────────────────────────────
+async def broadcast_worker(app: Application, batch_id: int, genre: str):
+    """Publishes queued songs one by one to the music channel."""
+    global BROADCAST_ACTIVE
+    logger.info(f"Starting broadcast for Batch #{batch_id}")
+
+    while BROADCAST_ACTIVE:
+        with get_db() as conn:
+            song = conn.execute(
+                """SELECT * FROM songs 
+                   WHERE batch_id = ? AND status = 'queued' 
+                   ORDER BY order_index ASC LIMIT 1""",
+                (batch_id,)
+            ).fetchone()
+
+        if not song:
+            logger.info(f"Batch #{batch_id} completed.")
+            break
+
+        song_id = song["id"]
+        caption = generate_caption(
+            artist=song["artist"],
+            title=song["title"],
+            album=song["album"],
+            duration=song["duration"],
+            genre=genre
         )
 
-        current_display = display_song(
-            artist,
-            title,
-        )
-
-        keyboard = [
+        channel_markup = InlineKeyboardMarkup([
             [
                 InlineKeyboardButton(
-                    text="⏭️ Skip",
-                    callback_data=(
-                        f"dup_skip:{pending_song_id}"
-                    ),
-                ),
-                InlineKeyboardButton(
-                    text="✅ Record Anyway",
-                    callback_data=(
-                        f"dup_record:{pending_song_id}"
-                    ),
-                ),
-            ]
-        ]
-
-        await message.reply_text(
-            "⚠️ <b>Duplicate detected</b>\n\n"
-
-            f"Current:\n"
-            f"🎵 <b>{current_display}</b>\n\n"
-
-            f"Already recorded:\n"
-            f"♻️ <b>{existing_display}</b>\n\n"
-
-            "What would you like to do?",
-            reply_markup=InlineKeyboardMarkup(
-                keyboard
-            ),
-            parse_mode="HTML",
-        )
-
-        return
-
-    # --------------------------------------------------------
-    # New song.
-    # --------------------------------------------------------
-
-    position = await get_next_position(
-        batch_id
-    )
-
-    async with aiosqlite.connect(
-        DATABASE_PATH
-    ) as db:
-
-        cursor = await db.execute(
-            """
-            INSERT INTO songs(
-                title,
-                artist,
-                album,
-                genre,
-                normalized_key,
-                telegram_file_id,
-                telegram_file_unique_id,
-                source_chat_id,
-                source_message_id,
-                duration,
-                status,
-                created_at
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                title,
-                artist or None,
-                album or None,
-                genre,
-                duplicate_key,
-                file_id,
-                file_unique_id,
-                message.chat_id,
-                message.message_id,
-                duration,
-                "recorded",
-                now_iso(),
-            ),
-        )
-
-        song_id = cursor.lastrowid
-
-        await db.execute(
-            """
-            INSERT INTO batch_songs(
-                batch_id,
-                song_id,
-                position
-            )
-            VALUES (?, ?, ?)
-            """,
-            (
-                batch_id,
-                song_id,
-                position,
-            ),
-        )
-
-        await db.commit()
-
-    append_processed_song(
-        artist,
-        title,
-        album,
-        genre,
-    )
-
-    display_name = display_song(
-        artist,
-        title,
-    )
-
-    await message.reply_text(
-        "✅ <b>Recorded</b>\n\n"
-        f"#{position} — <b>{display_name}</b>",
-        parse_mode="HTML",
-    )
-
-    logger.info(
-        "Recorded song: batch=%s position=%s song=%s",
-        batch_id,
-        position,
-        display_name,
-    )
-
-
-# ============================================================
-# DUPLICATE BUTTON HANDLER
-# ============================================================
-
-async def duplicate_button_handler(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-
-    query = update.callback_query
-
-    # Acknowledge the callback immediately.
-    await query.answer()
-
-    # Only the owner can make these decisions.
-    if (
-        not query.from_user
-        or query.from_user.id != OWNER_ID
-    ):
-
-        await query.answer(
-            "❌ You are not authorized.",
-            show_alert=True,
-        )
-
-        return
-
-    data = query.data or ""
-
-    if ":" not in data:
-        return
-
-    action, value = data.split(
-        ":",
-        1,
-    )
-
-    try:
-        pending_song_id = int(value)
-
-    except ValueError:
-        return
-
-    # --------------------------------------------------------
-    # Look up pending duplicate.
-    # --------------------------------------------------------
-
-    async with aiosqlite.connect(
-        DATABASE_PATH
-    ) as db:
-
-        cursor = await db.execute(
-            """
-            SELECT
-                pd.batch_id,
-                pd.song_id,
-                s.artist,
-                s.title,
-                s.album,
-                s.genre,
-                s.status
-            FROM pending_duplicates pd
-
-            JOIN songs s
-                ON s.id = pd.song_id
-
-            WHERE pd.song_id = ?
-
-            LIMIT 1
-            """,
-            (
-                pending_song_id,
-            ),
-        )
-
-        pending = await cursor.fetchone()
-
-    if not pending:
-
-        await query.answer(
-            "This decision has already been handled.",
-            show_alert=True,
-        )
-
-        return
-
-    batch_id = pending[0]
-    song_id = pending[1]
-
-    artist = pending[2]
-    title = pending[3]
-    album = pending[4]
-    genre = pending[5]
-    status = pending[6]
-
-    if status != "duplicate_pending":
-
-        await query.answer(
-            "This song has already been handled.",
-            show_alert=True,
-        )
-
-        return
-
-    display_name = display_song(
-        artist,
-        title,
-    )
-
-    # --------------------------------------------------------
-    # SKIP
-    # --------------------------------------------------------
-
-    if action == "dup_skip":
-
-        async with aiosqlite.connect(
-            DATABASE_PATH
-        ) as db:
-
-            await db.execute(
-                """
-                UPDATE songs
-                SET status = 'skipped'
-                WHERE id = ?
-                """,
-                (song_id,),
-            )
-
-            await db.execute(
-                """
-                DELETE FROM pending_duplicates
-                WHERE song_id = ?
-                """,
-                (song_id,),
-            )
-
-            await db.commit()
-
-        await query.edit_message_text(
-            "⏭️ <b>Skipped</b>\n\n"
-            f"{display_name}\n\n"
-            "Duplicate was not recorded.",
-            parse_mode="HTML",
-        )
-
-        return
-
-    # --------------------------------------------------------
-    # RECORD ANYWAY
-    # --------------------------------------------------------
-
-    if action == "dup_record":
-
-        position = await get_next_position(
-            batch_id
-        )
-
-        async with aiosqlite.connect(
-            DATABASE_PATH
-        ) as db:
-
-            await db.execute(
-                """
-                UPDATE songs
-                SET status = 'duplicate_recorded'
-                WHERE id = ?
-                """,
-                (song_id,),
-            )
-
-            await db.execute(
-                """
-                INSERT INTO batch_songs(
-                    batch_id,
-                    song_id,
-                    position
+                    text="➕ Add to Playlist",
+                    callback_data=f"pl_add_{song_id}",
+                    api_kwargs={"style": "success"}
                 )
-                VALUES (?, ?, ?)
-                """,
-                (
-                    batch_id,
-                    song_id,
-                    position,
-                ),
-            )
-
-            await db.execute(
-                """
-                DELETE FROM pending_duplicates
-                WHERE song_id = ?
-                """,
-                (song_id,),
-            )
-
-            await db.commit()
-
-        append_processed_song(
-            artist,
-            title,
-            album,
-            genre,
-        )
-
-        await query.edit_message_text(
-            "✅ <b>Recorded anyway</b>\n\n"
-            f"#{position} — {display_name}",
-            parse_mode="HTML",
-        )
-
-        return
-
-
-# ============================================================
-# TEXT MESSAGE HANDLER
-# ============================================================
-
-async def text_message_handler(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-
-    # Intentionally do nothing for text messages.
-    #
-    # We don't want captions or random text in the group
-    # to affect the recording system.
-    #
-    return
-
-
-# ============================================================
-# /HELP
-# ============================================================
-
-async def help_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-
-    await update.effective_message.reply_text(
-        "🎵 <b>Music Bot</b>\n\n"
-
-        "<b>Configuration</b>\n"
-        "/setgroupid\n"
-        "/setchannelid -100xxxxxxxxxx\n"
-        "/status\n\n"
-
-        "<b>Recording</b>\n"
-        '/record "genre"\n'
-        "/over\n\n"
-
-        "<b>Example</b>\n"
-        '/record "rnb"\n'
-        "→ Forward songs\n"
-        "→ /over",
-        parse_mode="HTML",
-    )
-
-
-# ============================================================
-# TELEGRAM APPLICATION
-# ============================================================
-
-def create_bot_application():
-
-    if not BOT_TOKEN:
-
-        raise RuntimeError(
-            "TELEGRAM_TOKEN is missing from "
-            "environment variables."
-        )
-
-    application = (
-        Application.builder()
-        .token(BOT_TOKEN)
-        .build()
-    )
-
-    # --------------------------------------------------------
-    # Commands
-    # --------------------------------------------------------
-
-    application.add_handler(
-        CommandHandler(
-            "start",
-            start_command,
-        )
-    )
-
-    application.add_handler(
-        CommandHandler(
-            "help",
-            help_command,
-        )
-    )
-
-    application.add_handler(
-        CommandHandler(
-            "setgroupid",
-            set_group_id_command,
-        )
-    )
-
-    application.add_handler(
-        CommandHandler(
-            "setchannelid",
-            set_channel_id_command,
-        )
-    )
-
-    application.add_handler(
-        CommandHandler(
-            "status",
-            status_command,
-        )
-    )
-
-    application.add_handler(
-        CommandHandler(
-            "record",
-            record_command,
-        )
-    )
-
-    application.add_handler(
-        CommandHandler(
-            "over",
-            over_command,
-        )
-    )
-
-    # --------------------------------------------------------
-    # Callback buttons
-    # --------------------------------------------------------
-
-    application.add_handler(
-        CallbackQueryHandler(
-            duplicate_button_handler,
-            pattern=r"^dup_(skip|record):\d+$",
-        )
-    )
-
-    # --------------------------------------------------------
-    # Audio messages
-    # --------------------------------------------------------
-
-    application.add_handler(
-        MessageHandler(
-            filters.AUDIO,
-            audio_message_handler,
-        )
-    )
-
-    return application
-
-
-# ============================================================
-# WEB SERVER
-# ============================================================
-
-async def create_web_server():
-
-    web_app = web.Application()
-
-    web_app.router.add_get(
-        "/",
-        web_index,
-    )
-
-    web_app.router.add_get(
-        "/health",
-        web_health,
-    )
-
-    runner = web.AppRunner(
-        web_app
-    )
-
-    await runner.setup()
-
-    site = web.TCPSite(
-        runner,
-        "0.0.0.0",
-        PORT,
-    )
-
-    await site.start()
-
-    logger.info(
-        "🌐 Web server started on port %s",
-        PORT,
-    )
-
-    return web_app, runner, site
-
-
-# ============================================================
-# MAIN
-# ============================================================
-
-async def main():
-
-    logger.info(
-        "Starting Music Bot..."
-    )
-
-    # --------------------------------------------------------
-    # Initialize database
-    # --------------------------------------------------------
-
-    await init_database()
-
-    # --------------------------------------------------------
-    # Telegram
-    # --------------------------------------------------------
-
-    application = create_bot_application()
-
-    await application.initialize()
-
-    bot_info = await application.bot.get_me()
-
-    logger.info(
-        "🤖 Connected as @%s (%s)",
-        bot_info.username,
-        bot_info.id,
-    )
-
-    # --------------------------------------------------------
-    # Web service
-    # --------------------------------------------------------
-
-    web_app, runner, site = (
-        await create_web_server()
-    )
-
-    # --------------------------------------------------------
-    # Start Telegram
-    # --------------------------------------------------------
-
-    await application.start()
-
-    await application.updater.start_polling()
-
-    logger.info(
-        "🤖 Telegram polling started."
-    )
-
-    # --------------------------------------------------------
-    # Shutdown event
-    # --------------------------------------------------------
-
-    stop_event = asyncio.Event()
-
-    loop = asyncio.get_running_loop()
-
-    for sig in (
-        signal.SIGINT,
-        signal.SIGTERM,
-    ):
+            ]
+        ])
 
         try:
-
-            loop.add_signal_handler(
-                sig,
-                stop_event.set,
+            sent_msg = await app.bot.send_audio(
+                chat_id=MUSIC_CHANNEL_ID,
+                audio=song["file_id"],
+                caption=caption,
+                parse_mode="HTML",
+                duration=song["duration"],
+                performer=song["artist"],
+                title=song["title"],
+                reply_markup=channel_markup
             )
 
-        except NotImplementedError:
+            with get_db() as conn:
+                conn.execute(
+                    "UPDATE songs SET status = 'published', channel_message_id = ? WHERE id = ?",
+                    (sent_msg.message_id, song_id)
+                )
 
-            # Windows doesn't support this
-            # event-loop signal handler.
-            pass
+            # Prevent Telegram 429 Flood Limits (post every 2.5s)
+            await asyncio.sleep(2.5)
 
-    try:
+        except Exception as e:
+            logger.error(f"Error publishing song #{song_id}: {e}")
+            await asyncio.sleep(5)
 
-        await stop_event.wait()
+    with get_db() as conn:
+        status_to_set = "completed" if not conn.execute("SELECT 1 FROM songs WHERE batch_id = ? AND status = 'queued'", (batch_id,)).fetchone() else "stopped"
+        conn.execute("UPDATE batches SET status = ? WHERE id = ?", (status_to_set, batch_id))
 
-    finally:
+    BROADCAST_ACTIVE = False
+    await app.bot.send_message(
+        chat_id=RECORDING_GROUP_ID,
+        text=f"🏁 <b>Broadcast finished for Batch #{batch_id}.</b> Status: <i>{status_to_set}</i>",
+        parse_mode="HTML"
+    )
 
-        logger.info(
-            "Shutting down..."
+
+# ─────────────────────────────────────────────
+# Subscriber Playlist Management
+# ─────────────────────────────────────────────
+async def add_to_playlist_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles channel subscribers clicking 'Add to Playlist'."""
+    query = update.callback_query
+    user_id = query.from_user.id
+    song_id = int(query.data.replace("pl_add_", ""))
+
+    with get_db() as conn:
+        already_saved = conn.execute(
+            "SELECT 1 FROM user_playlists WHERE user_id = ? AND song_id = ?",
+            (user_id, song_id)
+        ).fetchone()
+
+        if already_saved:
+            await query.answer("Already in your playlist! 🎧", show_alert=False)
+            return
+
+        conn.execute(
+            "INSERT INTO user_playlists (user_id, song_id) VALUES (?, ?)",
+            (user_id, song_id)
         )
 
-        # Stop Telegram polling.
-        if application.updater.running:
-
-            await application.updater.stop()
-
-        # Stop Telegram.
-        await application.stop()
-        await application.shutdown()
-
-        # Stop web server.
-        await site.stop()
-        await runner.cleanup()
-
-        logger.info(
-            "Shutdown complete."
-        )
+    await query.answer("Added to your playlist! ⭐ Check your private chat with the bot.", show_alert=False)
 
 
-# ============================================================
-# ENTRY POINT
-# ============================================================
+async def user_playlist_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Displays saved songs in user's private chat."""
+    if update.effective_chat.type != "private":
+        await update.message.reply_text("Please check your playlist in my private chat! 🎧")
+        return
+
+    user_id = update.effective_user.id
+    page = 1
+    await render_playlist_page(update.message, user_id, page)
+
+
+async def render_playlist_page(message, user_id: int, page: int, edit=False):
+    """Renders a paginated playlist with song playback buttons."""
+    limit = 5
+    offset = (page - 1) * limit
+
+    with get_db() as conn:
+        total = conn.execute(
+            "SELECT COUNT(*) as c FROM user_playlists WHERE user_id = ?",
+            (user_id,)
+        ).fetchone()["c"]
+
+        rows = conn.execute(
+            """SELECT s.id, s.artist, s.title, s.duration 
+               FROM user_playlists up
+               JOIN songs s ON up.song_id = s.id
+               WHERE up.user_id = ?
+               ORDER BY up.added_at DESC
+               LIMIT ? OFFSET ?""",
+            (user_id, limit, offset)
+        ).fetchall()
+
+    if total == 0:
+        text = "🎧 <b>Your playlist is empty!</b>\n\nTap the green <b>Add to Playlist</b> button under any song in our channel to save it here."
+        if edit:
+            await message.edit_text(text, parse_mode="HTML")
+        else:
+            await message.reply_text(text, parse_mode="HTML")
+        return
+
+    total_pages = (total + limit - 1) // limit
+    text = f"🎧 <b>Your Saved Playlist</b> (Page {page}/{total_pages})\n\n"
+
+    keyboard = []
+    for row in rows:
+        artist = row["artist"] or "Unknown"
+        title = row["title"] or "Track"
+        text += f"• 🎵 <b>{artist}</b> - {title} <i>({format_duration(row['duration'])})</i>\n"
+        keyboard.append([
+            InlineKeyboardButton(f"▶️ Play {title[:20]}", callback_data=f"pl_play_{row['id']}")
+        ])
+
+    nav_buttons = []
+    if page > 1:
+        nav_buttons.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"pl_page_{page-1}"))
+    if page < total_pages:
+        nav_buttons.append(InlineKeyboardButton("Next ➡️", callback_data=f"pl_page_{page+1}"))
+    if nav_buttons:
+        keyboard.append(nav_buttons)
+
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    if edit:
+        await message.edit_text(text, reply_markup=reply_markup, parse_mode="HTML")
+    else:
+        await message.reply_text(text, reply_markup=reply_markup, parse_mode="HTML")
+
+
+async def playlist_page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles pagination and audio delivery."""
+    query = update.callback_query
+    data = query.data
+    user_id = query.from_user.id
+
+    if data.startswith("pl_page_"):
+        page = int(data.replace("pl_page_", ""))
+        await render_playlist_page(query.message, user_id, page, edit=True)
+        await query.answer()
+
+    elif data.startswith("pl_play_"):
+        song_id = int(data.replace("pl_play_", ""))
+        with get_db() as conn:
+            song = conn.execute("SELECT file_id, artist, title FROM songs WHERE id = ?", (song_id,)).fetchone()
+
+        if song:
+            await query.answer("Delivering audio...")
+            await context.bot.send_audio(
+                chat_id=user_id,
+                audio=song["file_id"],
+                title=song["title"],
+                performer=song["artist"]
+            )
+        else:
+            await query.answer("Audio not found.", show_alert=True)
+
+
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Welcome handler for direct messages."""
+    await update.message.reply_text(
+        "👋 <b>Welcome to the Music Hub!</b>\n\n"
+        "• Tap <b>Add to Playlist</b> under any track in our channel to save it.\n"
+        "• Send <code>/playlist</code> here to view and play your saved songs.",
+        parse_mode="HTML"
+    )
+
+
+# ─────────────────────────────────────────────
+# Main Application Runtime
+# ─────────────────────────────────────────────
+async def main():
+    if not BOT_TOKEN:
+        logger.error("TELEGRAM_TOKEN is missing! Set it in your environment variables.")
+        return
+
+    init_db()
+
+    # 1. Initialize Telegram Bot
+    app = Application.builder().token(BOT_TOKEN).build()
+
+    # Admin Handlers
+    app.add_handler(CommandHandler("record", record_command))
+    app.add_handler(CommandHandler("over", over_command))
+    app.add_handler(CommandHandler("stopbroadcast", stopbroadcast_command))
+    app.add_handler(CommandHandler("status", status_command))
+
+    # User Handlers
+    app.add_handler(CommandHandler("start", start_command))
+    app.add_handler(CommandHandler("playlist", user_playlist_command))
+
+    # Callbacks
+    app.add_handler(CallbackQueryHandler(duplicate_callback_handler, pattern=r"^dup_"))
+    app.add_handler(CallbackQueryHandler(add_to_playlist_callback, pattern=r"^pl_add_"))
+    app.add_handler(CallbackQueryHandler(playlist_page_callback, pattern=r"^pl_(page|play)_"))
+
+    # Audio message listener (in recording group)
+    app.add_handler(MessageHandler(filters.AUDIO, handle_audio_message))
+
+    await app.initialize()
+
+    # 2. Start Web Service on PORT (for EthioDeploy / Render health checks)
+    web_app = web.Application()
+    web_app.router.add_get("/", web_index)
+    runner = web.AppRunner(web_app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
+    await site.start()
+    logger.info(f"🚀 Web Server started on port {PORT}")
+
+    # 3. Start Telegram Long-Polling for ALL update types
+    await app.start()
+    await app.updater.start_polling(
+        drop_pending_updates=False,
+        allowed_updates=Update.ALL_TYPES  # Ensures all channels, groups, and callbacks are polled
+    )
+    logger.info("🤖 Music Management Bot is actively polling!")
+
+    # 4. Start the background Keep-Alive Pinger
+    pinger_task = asyncio.create_task(keep_alive_pinger())
+
+    # 5. Graceful exit handling
+    stop_signal = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        loop.add_signal_handler(sig, stop_signal.set)
+
+    await stop_signal.wait()
+
+    # 6. Shutting down
+    logger.info("Shutting down bot...")
+    pinger_task.cancel()
+    await app.updater.stop()
+    await app.stop()
+    await app.shutdown()
+    await site.stop()
+    await runner.cleanup()
+
 
 if __name__ == "__main__":
-
     try:
-
         asyncio.run(main())
-
     except KeyboardInterrupt:
-
         pass
