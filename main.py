@@ -21,7 +21,7 @@ from telegram.ext import (
 # ─────────────────────────────────────────────
 BOT_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 PORT = int(os.environ.get("PORT", "8080"))
-APP_URL = os.environ.get("APP_URL")  # Optional: Your public EthioDeploy domain
+APP_URL = os.environ.get("APP_URL")
 
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "7429996344"))
 
@@ -43,8 +43,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# State tracking for ongoing broadcasts
+# State tracking
 BROADCAST_ACTIVE = False
+ADMIN_MODE_USERS = set()  # Tracks active admin DM sessions
 
 
 # ─────────────────────────────────────────────
@@ -98,7 +99,6 @@ def init_db():
 # Helper Functions
 # ─────────────────────────────────────────────
 def normalize_key(artist: str | None, title: str | None) -> str:
-    """Generates a clean, alphanumeric string for deduplication."""
     text = f"{artist or ''}_{title or ''}".lower()
     return re.sub(r"[^a-z0-9]", "", text)
 
@@ -134,12 +134,16 @@ def generate_caption(artist: str | None, title: str | None, album: str | None, d
     caption += " ".join([t for t in tags if t])
     return caption
 
+def is_recording_group(chat_id: int) -> bool:
+    cid_str = str(chat_id)
+    target_str = str(RECORDING_GROUP_ID).replace("-100", "-")
+    return cid_str == str(RECORDING_GROUP_ID) or cid_str == target_str or cid_str.replace("-100", "-") == target_str
+
 
 # ─────────────────────────────────────────────
-# Dynamic Web Dashboard for EthioDeploy / Health Check
+# Dynamic Web Dashboard & Keep-Alive Pinger
 # ─────────────────────────────────────────────
 async def web_index(request):
-    """Renders a live dark-mode status page with current database stats."""
     with get_db() as conn:
         active_batch = conn.execute("SELECT id, genre FROM batches WHERE status = 'recording'").fetchone()
         total_songs = conn.execute("SELECT COUNT(*) as c FROM songs").fetchone()["c"]
@@ -193,14 +197,10 @@ async def web_index(request):
     return web.Response(text=html, content_type="text/html")
 
 
-# ─────────────────────────────────────────────
-# Web Service Self-Ping (Prevents Instance Sleep)
-# ─────────────────────────────────────────────
 async def keep_alive_pinger():
-    """Periodically pings the local web service every 10 minutes to prevent container sleep."""
-    await asyncio.sleep(15)  # Wait for web service startup
+    await asyncio.sleep(15)
     target_url = APP_URL or f"http://127.0.0.1:{PORT}/"
-    logger.info(f"🔄 Keep-alive pinger started. Polling: {target_url}")
+    logger.info(f"🔄 Keep-alive pinger started. Target: {target_url}")
 
     async with aiohttp.ClientSession() as session:
         while True:
@@ -209,15 +209,49 @@ async def keep_alive_pinger():
                     logger.info(f"💓 Keep-alive ping sent (HTTP {resp.status})")
             except Exception as e:
                 logger.warning(f"⚠️ Keep-alive ping notice: {e}")
-            await asyncio.sleep(600)  # Ping every 10 minutes
+            await asyncio.sleep(600)
 
 
 # ─────────────────────────────────────────────
-# Admin Commands: /record, /over, /stopbroadcast, /status
+# Admin Mode & Session Handlers
 # ─────────────────────────────────────────────
+async def adminmode_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Enables admin mode in private chat."""
+    user = update.effective_user
+    if user.id != ADMIN_ID:
+        return
+
+    if update.effective_chat.type != "private":
+        await update.message.reply_text("⚠️ Please send <code>/adminmode</code> in my private DM.", parse_mode="HTML")
+        return
+
+    ADMIN_MODE_USERS.add(user.id)
+    await update.message.reply_text(
+        "🛠️ <b>Admin Mode: Activated</b>\n\n"
+        "You can now manage the bot directly from here:\n"
+        "• <code>/record &lt;genre&gt;</code> - Open a recording session (e.g. <code>/record rnb</code>)\n"
+        "• <b>Forward Songs Here</b> - Send/forward tracks directly to this chat!\n"
+        "• <code>/over</code> - Close session & begin automatic publishing\n"
+        "• <code>/stopbroadcast</code> - Pause or stop publishing\n"
+        "• <code>/status</code> - View current batch & stats\n"
+        "• <code>/adminmodeoff</code> - Exit admin mode",
+        parse_mode="HTML"
+    )
+
+async def adminmodeoff_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Disables admin mode in private chat."""
+    user = update.effective_user
+    if user.id != ADMIN_ID:
+        return
+
+    ADMIN_MODE_USERS.discard(user.id)
+    await update.message.reply_text("🔒 <b>Admin Mode: Deactivated</b>. Back to standard user mode.", parse_mode="HTML")
+
+
 async def record_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Starts a new recording batch for a specified genre."""
-    if update.effective_user.id != ADMIN_ID:
+    user_id = update.effective_user.id
+    if user_id != ADMIN_ID:
         return
 
     args = context.args
@@ -243,21 +277,22 @@ async def record_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"🎙️ <b>Recording Session #{batch_id} Started!</b>\n"
         f"• <b>Genre:</b> #{make_hashtag(genre)[1:]}\n\n"
-        f"👉 Forward songs into this group now.\n"
-        f"👉 Send <code>/over</code> when finished to begin automated channel publishing.",
+        f"👉 <b>Forward songs directly here</b> (or into the group).\n"
+        f"👉 Send <code>/over</code> when finished to begin channel broadcast.",
         parse_mode="HTML"
     )
 
 async def over_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Closes the recording session and starts publishing to the channel."""
     global BROADCAST_ACTIVE
-    if update.effective_user.id != ADMIN_ID:
+    user_id = update.effective_user.id
+    if user_id != ADMIN_ID:
         return
 
     with get_db() as conn:
         batch = conn.execute("SELECT id, genre FROM batches WHERE status = 'recording'").fetchone()
         if not batch:
-            await update.message.reply_text("ℹ️ No active recording session found.")
+            await update.message.reply_text("ℹ️ No active recording session found. Start one with <code>/record &lt;genre&gt;</code>.", parse_mode="HTML")
             return
 
         batch_id = batch["id"]
@@ -278,7 +313,7 @@ async def over_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     BROADCAST_ACTIVE = True
-    asyncio.create_task(broadcast_worker(context.application, batch_id, genre))
+    asyncio.create_task(broadcast_worker(context.application, batch_id, genre, notify_chat_id=update.effective_chat.id))
 
 async def stopbroadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Stops the active channel broadcast."""
@@ -303,8 +338,11 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         total_songs = conn.execute("SELECT COUNT(*) as c FROM songs").fetchone()["c"]
         published_songs = conn.execute("SELECT COUNT(*) as c FROM songs WHERE status = 'published'").fetchone()["c"]
 
+    is_adm_mode = "🟢 Active" if update.effective_user.id in ADMIN_MODE_USERS else "⚪ Inactive"
+
     status_msg = (
         f"⚙️ <b>Bot System Status</b>\n\n"
+        f"• <b>Admin Mode in DM:</b> {is_adm_mode}\n"
         f"• <b>Active Broadcast:</b> {'🟢 Running' if BROADCAST_ACTIVE else '⚪ Idle'}\n"
         f"• <b>Recording Group:</b> <code>{RECORDING_GROUP_ID}</code>\n"
         f"• <b>Music Channel:</b> <code>{MUSIC_CHANNEL_ID}</code>\n"
@@ -321,34 +359,56 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ─────────────────────────────────────────────
-# Audio Ingestion & Duplicate Handling
+# Audio Ingestion (Group + DM Support)
 # ─────────────────────────────────────────────
 async def handle_audio_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Listens for forwarded audio in the recording group."""
+    """Ingests audio sent either in the recording group OR directly in DM during admin mode."""
     msg = update.message
-    if not msg or not msg.audio:
+    if not msg:
         return
 
-    if msg.chat_id != RECORDING_GROUP_ID:
+    is_group = is_recording_group(msg.chat_id)
+    is_dm_admin = msg.chat.type == "private" and msg.from_user.id == ADMIN_ID
+
+    # Only accept audio from recording group or direct admin DM
+    if not (is_group or is_dm_admin):
         return
 
     audio = msg.audio
-    artist = audio.performer
-    title = audio.title or audio.file_name or "Unknown Track"
+    doc = msg.document
+    
+    file_id = None
+    file_unique_id = None
+    duration = 0
+    artist = "Unknown Artist"
+    title = "Unknown Track"
     album = None
-    duration = audio.duration
-    file_id = audio.file_id
-    file_unique_id = audio.file_unique_id
 
+    if audio:
+        file_id = audio.file_id
+        file_unique_id = audio.file_unique_id
+        duration = audio.duration
+        artist = audio.performer or "Unknown Artist"
+        title = audio.title or audio.file_name or "Track"
+    elif doc and ((doc.mime_type and "audio" in doc.mime_type) or doc.file_name.lower().endswith(('.mp3', '.m4a', '.flac', '.wav', '.ogg'))):
+        file_id = doc.file_id
+        file_unique_id = doc.file_unique_id
+        title = doc.file_name
+    else:
+        return
+
+    # Check for active recording batch
     with get_db() as conn:
         batch = conn.execute("SELECT id FROM batches WHERE status = 'recording'").fetchone()
         if not batch:
+            if is_dm_admin:
+                await msg.reply_text("⚠️ No active recording session! Send <code>/record &lt;genre&gt;</code> first.", parse_mode="HTML")
             return
 
         batch_id = batch["id"]
         norm = normalize_key(artist, title)
 
-        # Check for duplicates across all previous batches
+        # Duplicate check across entire database
         existing = conn.execute(
             "SELECT id, artist, title FROM songs WHERE norm_key = ? AND status != 'skipped'",
             (norm,)
@@ -376,8 +436,8 @@ async def handle_audio_message(update: Update, context: ContextTypes.DEFAULT_TYP
             ]
             await msg.reply_text(
                 f"⚠️ <b>Duplicate Detected</b>\n"
-                f"🎵 <b>{artist} - {title}</b> matches an existing song in the database.\n"
-                f"What would you like to do?",
+                f"🎵 <b>{artist} - {title}</b> already exists in DB.\n"
+                f"Action for track #{next_order}:",
                 reply_markup=InlineKeyboardMarkup(buttons),
                 parse_mode="HTML"
             )
@@ -387,6 +447,7 @@ async def handle_audio_message(update: Update, context: ContextTypes.DEFAULT_TYP
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?)""",
                 (batch_id, file_id, file_unique_id, artist, title, album, duration, norm, next_order)
             )
+            logger.info(f"✅ Queued track #{next_order}: {artist} - {title}")
 
 
 async def duplicate_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -414,10 +475,12 @@ async def duplicate_callback_handler(update: Update, context: ContextTypes.DEFAU
 # ─────────────────────────────────────────────
 # Automated Channel Publishing Queue
 # ─────────────────────────────────────────────
-async def broadcast_worker(app: Application, batch_id: int, genre: str):
+async def broadcast_worker(app: Application, batch_id: int, genre: str, notify_chat_id: int):
     """Publishes queued songs one by one to the music channel."""
     global BROADCAST_ACTIVE
     logger.info(f"Starting broadcast for Batch #{batch_id}")
+
+    published_count = 0
 
     while BROADCAST_ACTIVE:
         with get_db() as conn:
@@ -468,6 +531,7 @@ async def broadcast_worker(app: Application, batch_id: int, genre: str):
                     "UPDATE songs SET status = 'published', channel_message_id = ? WHERE id = ?",
                     (sent_msg.message_id, song_id)
                 )
+            published_count += 1
 
             # Prevent Telegram 429 Flood Limits (post every 2.5s)
             await asyncio.sleep(2.5)
@@ -481,9 +545,13 @@ async def broadcast_worker(app: Application, batch_id: int, genre: str):
         conn.execute("UPDATE batches SET status = ? WHERE id = ?", (status_to_set, batch_id))
 
     BROADCAST_ACTIVE = False
+    
+    # Notify admin directly in DM/chat where /over was sent
     await app.bot.send_message(
-        chat_id=RECORDING_GROUP_ID,
-        text=f"🏁 <b>Broadcast finished for Batch #{batch_id}.</b> Status: <i>{status_to_set}</i>",
+        chat_id=notify_chat_id,
+        text=f"🏁 <b>Broadcast finished for Batch #{batch_id}!</b>\n"
+             f"• <b>Published:</b> {published_count} tracks\n"
+             f"• <b>Status:</b> <i>{status_to_set}</i>",
         parse_mode="HTML"
     )
 
@@ -527,7 +595,6 @@ async def user_playlist_command(update: Update, context: ContextTypes.DEFAULT_TY
 
 
 async def render_playlist_page(message, user_id: int, page: int, edit=False):
-    """Renders a paginated playlist with song playback buttons."""
     limit = 5
     offset = (page - 1) * limit
 
@@ -584,7 +651,6 @@ async def render_playlist_page(message, user_id: int, page: int, edit=False):
 
 
 async def playlist_page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handles pagination and audio delivery."""
     query = update.callback_query
     data = query.data
     user_id = query.from_user.id
@@ -612,13 +678,22 @@ async def playlist_page_callback(update: Update, context: ContextTypes.DEFAULT_T
 
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Welcome handler for direct messages."""
-    await update.message.reply_text(
-        "👋 <b>Welcome to the Music Hub!</b>\n\n"
-        "• Tap <b>Add to Playlist</b> under any track in our channel to save it.\n"
-        "• Send <code>/playlist</code> here to view and play your saved songs.",
-        parse_mode="HTML"
-    )
+    """Welcome handler."""
+    user = update.effective_user
+    if user.id == ADMIN_ID:
+        await update.message.reply_text(
+            "👋 <b>Welcome Admin!</b>\n\n"
+            "Send <code>/adminmode</code> to manage music recording & broadcasts,\n"
+            "or <code>/playlist</code> to view your saved personal music.",
+            parse_mode="HTML"
+        )
+    else:
+        await update.message.reply_text(
+            "👋 <b>Welcome to the Music Hub!</b>\n\n"
+            "• Tap <b>Add to Playlist</b> under any track in our channel to save it.\n"
+            "• Send <code>/playlist</code> here to view and play your saved songs.",
+            parse_mode="HTML"
+        )
 
 
 # ─────────────────────────────────────────────
@@ -631,10 +706,11 @@ async def main():
 
     init_db()
 
-    # 1. Initialize Telegram Bot
     app = Application.builder().token(BOT_TOKEN).build()
 
-    # Admin Handlers
+    # Admin Mode Handlers
+    app.add_handler(CommandHandler("adminmode", adminmode_command))
+    app.add_handler(CommandHandler("adminmodeoff", adminmodeoff_command))
     app.add_handler(CommandHandler("record", record_command))
     app.add_handler(CommandHandler("over", over_command))
     app.add_handler(CommandHandler("stopbroadcast", stopbroadcast_command))
@@ -649,12 +725,12 @@ async def main():
     app.add_handler(CallbackQueryHandler(add_to_playlist_callback, pattern=r"^pl_add_"))
     app.add_handler(CallbackQueryHandler(playlist_page_callback, pattern=r"^pl_(page|play)_"))
 
-    # Audio message listener (in recording group)
-    app.add_handler(MessageHandler(filters.AUDIO, handle_audio_message))
+    # Audio message listener (handles native Audio & audio Files/Documents)
+    app.add_handler(MessageHandler(filters.AUDIO | filters.Document.AUDIO | filters.Document.FileExtension("mp3"), handle_audio_message))
 
     await app.initialize()
 
-    # 2. Start Web Service on PORT (for EthioDeploy / Render health checks)
+    # Web Server for EthioDeploy / Render Keep-Alive
     web_app = web.Application()
     web_app.router.add_get("/", web_index)
     runner = web.AppRunner(web_app)
@@ -663,18 +739,18 @@ async def main():
     await site.start()
     logger.info(f"🚀 Web Server started on port {PORT}")
 
-    # 3. Start Telegram Long-Polling for ALL update types
+    # Start Telegram Polling
     await app.start()
     await app.updater.start_polling(
         drop_pending_updates=False,
-        allowed_updates=Update.ALL_TYPES  # Ensures all channels, groups, and callbacks are polled
+        allowed_updates=Update.ALL_TYPES
     )
     logger.info("🤖 Music Management Bot is actively polling!")
 
-    # 4. Start the background Keep-Alive Pinger
+    # Start Keep-Alive Pinger
     pinger_task = asyncio.create_task(keep_alive_pinger())
 
-    # 5. Graceful exit handling
+    # Graceful exit handling
     stop_signal = asyncio.Event()
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
@@ -682,7 +758,7 @@ async def main():
 
     await stop_signal.wait()
 
-    # 6. Shutting down
+    # Cleanup
     logger.info("Shutting down bot...")
     pinger_task.cancel()
     await app.updater.stop()
@@ -690,7 +766,6 @@ async def main():
     await app.shutdown()
     await site.stop()
     await runner.cleanup()
-
 
 if __name__ == "__main__":
     try:
