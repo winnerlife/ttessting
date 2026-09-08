@@ -41,6 +41,7 @@ def format_tg_id(raw_id: str | int) -> int:
     return val
 
 RECORDING_GROUP_ID = format_tg_id(os.environ.get("RECORDING_GROUP_ID", "-5309919588"))
+BACKUP_GROUP_ID = format_tg_id(os.environ.get("BACKUP_GROUP_ID", "-5309919588"))
 MUSIC_CHANNEL_ID = format_tg_id(os.environ.get("MUSIC_CHANNEL_ID", "-4448938519"))
 
 # Channel Username & Link
@@ -66,9 +67,10 @@ BOT_USERNAME = None
 # Database Layer (SQLite with WAL mode)
 # ─────────────────────────────────────────────
 def get_db():
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=15)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA busy_timeout = 5000;")
     return conn
 
 def init_db():
@@ -202,6 +204,118 @@ async def send_fsub_gate(message_or_query, pending_song_id: int | None = None, e
 
 
 # ─────────────────────────────────────────────
+# Zero-Local-State Backup Engine (Telegram Cloud Memory)
+# ─────────────────────────────────────────────
+def is_db_file(filename: str) -> bool:
+    """Identifies database files to prevent corruption via text editing."""
+    blocked = ('.db', '.db-wal', '.db-shm', '.sqlite', '.sqlite3')
+    base = os.path.basename(filename).lower()
+    return any(base.endswith(ext) for ext in blocked) or base.startswith("music_bot.db")
+
+def get_db_size() -> int:
+    return os.path.getsize(DB_PATH) if os.path.exists(DB_PATH) else 0
+
+async def auto_restore_on_boot(bot):
+    """
+    Checks if the host wiped the filesystem on restart.
+    If so, automatically pulls and restores the latest pinned DB backup from the group.
+    """
+    song_count = 0
+    try:
+        with get_db() as conn:
+            song_count = conn.execute("SELECT COUNT(*) as c FROM songs").fetchone()["c"]
+    except Exception:
+        song_count = 0
+
+    if song_count == 0:
+        logger.warning("⚠️ Empty/Wiped database detected! Checking backup group for pinned snapshot...")
+        try:
+            chat = await bot.get_chat(BACKUP_GROUP_ID)
+            pinned = chat.pinned_message
+            if pinned and pinned.document and "music_bot.db" in (pinned.document.file_name or ""):
+                file_obj = await bot.get_file(pinned.document.file_id)
+                await file_obj.download_to_drive(DB_PATH)
+                logger.info("✅ Database AUTO-RESTORED from group pinned backup!")
+                init_db()
+            else:
+                logger.info("ℹ️ No previous pinned backup found in group to restore.")
+        except Exception as e:
+            logger.error(f"Failed to auto-restore backup: {e}")
+
+async def perform_group_backup(bot, force: bool = False) -> bool:
+    """
+    Flushes WAL into music_bot.db, deletes old pinned backup message,
+    uploads the clean DB, and pins it silently.
+    """
+    # 1. Force flush all WAL transactions into the main .db file
+    try:
+        with get_db() as conn:
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+    except Exception as e:
+        logger.warning(f"wal_checkpoint notice: {e}")
+
+    current_size = get_db_size()
+    if current_size == 0:
+        return False
+
+    # 2. Get the current pinned backup directly from Telegram (Zero local files needed)
+    try:
+        chat = await bot.get_chat(BACKUP_GROUP_ID)
+        pinned = chat.pinned_message
+    except Exception as e:
+        logger.warning(f"Could not fetch chat info: {e}")
+        pinned = None
+
+    # Check if size changed compared to pinned file
+    if not force and pinned and pinned.document:
+        if pinned.document.file_size == current_size:
+            logger.info("ℹ️ DB byte size unchanged. Skipping hourly backup.")
+            return False
+
+    # 3. Delete the old pinned backup message
+    if pinned:
+        try:
+            await bot.delete_message(chat_id=BACKUP_GROUP_ID, message_id=pinned.message_id)
+        except Exception as e:
+            logger.info(f"Old pinned backup could not be deleted: {e}")
+
+    # 4. Upload the clean, complete database
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with open(DB_PATH, "rb") as f:
+        msg = await bot.send_document(
+            chat_id=BACKUP_GROUP_ID,
+            document=f,
+            filename="music_bot.db",
+            caption=f"📦 #DB_BACKUP\n<b>File:</b> <code>music_bot.db</code>\n<b>Size:</b> {format_file_size(current_size)}\n🕒 <i>{now_str}</i>",
+            parse_mode="HTML"
+        )
+
+    # 5. Pin the new backup silently so it serves as cloud memory
+    try:
+        await bot.pin_chat_message(
+            chat_id=BACKUP_GROUP_ID,
+            message_id=msg.message_id,
+            disable_notification=True
+        )
+    except Exception as e:
+        logger.warning(f"Could not pin backup message: {e}")
+
+    logger.info(f"✅ Clean DB backup posted & pinned in group {BACKUP_GROUP_ID}.")
+    return True
+
+async def backup_scheduler_worker(bot):
+    """Checks DB byte size every 1 hour (3600 seconds) and updates group backups."""
+    await asyncio.sleep(60)
+    logger.info("🕒 Hourly DB backup scheduler started.")
+    while True:
+        try:
+            await perform_group_backup(bot)
+        except Exception as e:
+            logger.error(f"Error in backup_scheduler_worker: {e}")
+        await asyncio.sleep(3600)
+
+
+# ─────────────────────────────────────────────
 # Web Admin File Manager (Auth Protected)
 # ─────────────────────────────────────────────
 def check_web_auth(request: web.Request) -> bool:
@@ -222,7 +336,7 @@ def auth_required(handler):
         if not check_web_auth(request):
             return web.Response(
                 status=401,
-                text="Unauthorized Access. Please supply valid credentials.",
+                text="Unauthorized Access. Please supply valid ADMIN and PASS credentials.",
                 headers={"WWW-Authenticate": 'Basic realm="Bot Admin File Manager"'}
             )
         return await handler(request)
@@ -290,10 +404,13 @@ async def admin_files_page(request: web.Request):
         else:
             icon = "📄"
             name_cell = f'{icon} {html.escape(item["name"])}'
-            actions = (
-                f'<a href="/admin/download?p={item["rel"]}" class="btn-sm btn-dl">⬇️ Download</a> '
-                f'<a href="/admin/edit?p={item["rel"]}" class="btn-sm btn-edit">✏️ Edit</a>'
-            )
+            actions = f'<a href="/admin/download?p={item["rel"]}" class="btn-sm btn-dl">⬇️ Download</a>'
+            
+            # Disable edit button for all .db / binary database files
+            if not is_db_file(item["name"]):
+                actions += f' <a href="/admin/edit?p={item["rel"]}" class="btn-sm btn-edit">✏️ Edit</a>'
+            else:
+                actions += ' <span style="color:#64748b;font-size:0.8em;">(DB protected)</span>'
 
         rows_html += f"""
         <tr>
@@ -379,6 +496,13 @@ async def admin_edit_file_get(request: web.Request):
     if not target_file or not os.path.isfile(target_file):
         return web.Response(text="File not found", status=404)
 
+    # Disallow text-editing of database files
+    if is_db_file(target_file):
+        return web.Response(
+            text="⚠️ Editing database (.db, .db-wal, .db-shm) files via text editor is disabled to prevent database corruption. Please download the file instead.",
+            status=403
+        )
+
     try:
         with open(target_file, "r", encoding="utf-8", errors="replace") as f:
             content = f.read()
@@ -421,6 +545,9 @@ async def admin_edit_file_post(request: web.Request):
 
     if not target_file or not os.path.isfile(target_file):
         return web.Response(text="File not found", status=404)
+
+    if is_db_file(target_file):
+        return web.Response(text="Database editing prohibited.", status=403)
 
     data = await request.post()
     new_content = data.get("content", "")
@@ -554,6 +681,7 @@ async def adminmode_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• <code>/record &lt;genre&gt;</code> - Open a recording session (e.g. <code>/record rnb</code>)\n"
         "• <b>Forward Songs Here</b> - Send/forward tracks directly to this chat!\n"
         "• <code>/skipall</code> - Skip all pending duplicate tracks at once\n"
+        "• <code>/sync</code> - Reply to a DB document to restore it, or force backup update\n"
         "• <code>/over</code> - Close session & begin automatic publishing\n"
         "• <code>/stopbroadcast</code> - Pause or stop publishing\n"
         "• <code>/pin</code> - Reply to any message to post & pin it to the channel with a 'Go listen' button\n"
@@ -600,7 +728,7 @@ async def record_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🎙️ <b>Recording Session #{batch_id} Started!</b>\n"
         f"• <b>Genre:</b> #{make_hashtag(genre)[1:]}\n\n"
         f"👉 <b>Forward songs directly here</b> (or into the group).\n"
-        f"👉 Send <code>/skipall</code> at any time to skip duplicate warnings.\n"
+        f"👉 Send <code>/skipall</code> to skip duplicate tracks.\n"
         f"👉 Send <code>/over</code> when finished to begin channel broadcast.",
         parse_mode="HTML"
     )
@@ -618,6 +746,45 @@ async def skipall_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🚫 <b>Skipped {skipped_count} duplicate song(s).</b>",
         parse_mode="HTML"
     )
+
+async def sync_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Handles manual DB restoration from uploaded files, 
+    and initializes/forces the automated group backup engine.
+    """
+    if update.effective_user.id != ADMIN_ID:
+        return
+
+    replied = update.message.reply_to_message
+    if replied and replied.document:
+        doc = replied.document
+        fname = doc.file_name or "music_bot.db"
+        valid_files = ("music_bot.db", "music_bot.db-wal", "music_bot.db-shm")
+
+        if fname in valid_files:
+            file_obj = await context.bot.get_file(doc.file_id)
+            await file_obj.download_to_drive(custom_path=fname)
+            await update.message.reply_text(
+                f"📥 <b>Restored & Replaced:</b> <code>{fname}</code>\n"
+                f"• Size: {format_file_size(doc.file_size or 0)}",
+                parse_mode="HTML"
+            )
+            try:
+                init_db()
+            except Exception:
+                pass
+            return
+        else:
+            await update.message.reply_text(
+                f"⚠️ File name must be one of: <code>{', '.join(valid_files)}</code>.",
+                parse_mode="HTML"
+            )
+            return
+
+    # If run without reply: Force immediate clean backup push and pin it
+    await update.message.reply_text("🔄 <b>Syncing database and pushing fresh backup to group...</b>", parse_mode="HTML")
+    await perform_group_backup(context.bot, force=True)
+    await update.message.reply_text("✅ <b>Database synchronized!</b> Backup posted, pinned, and 1-hour monitor is active.", parse_mode="HTML")
 
 async def over_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Closes the recording session and starts publishing to the channel."""
@@ -681,7 +848,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"⚙️ <b>Bot System Status</b>\n\n"
         f"• <b>Admin Mode in DM:</b> {is_adm_mode}\n"
         f"• <b>Active Broadcast:</b> {'🟢 Running' if BROADCAST_ACTIVE else '⚪ Idle'}\n"
-        f"• <b>Recording Group:</b> <code>{RECORDING_GROUP_ID}</code>\n"
+        f"• <b>Recording/Backup Group:</b> <code>{BACKUP_GROUP_ID}</code>\n"
         f"• <b>Music Channel:</b> <code>{MUSIC_CHANNEL_ID}</code> (@{CHANNEL_USERNAME})\n"
         f"• <b>Total Songs in DB:</b> {total_songs}\n"
         f"• <b>Total Published:</b> {published_songs}\n"
@@ -775,10 +942,10 @@ async def handle_audio_message(update: Update, context: ContextTypes.DEFAULT_TYP
         duration = audio.duration
         artist = audio.performer or "Unknown Artist"
         title = audio.title or audio.file_name or "Track"
-    elif doc and ((doc.mime_type and "audio" in doc.mime_type) or doc.file_name.lower().endswith(('.mp3', '.m4a', '.flac', '.wav', '.ogg'))):
+    elif doc and ((doc.mime_type and "audio" in doc.mime_type) or (doc.file_name and doc.file_name.lower().endswith(('.mp3', '.m4a', '.flac', '.wav', '.ogg')))):
         file_id = doc.file_id
         file_unique_id = doc.file_unique_id
-        title = doc.file_name
+        title = doc.file_name or "Track"
     else:
         return
 
@@ -1060,7 +1227,7 @@ async def render_playlist_page(message, user_id: int, page: int, edit=False):
         artist = row["artist"] or "Unknown"
         title = row["title"] or "Track"
         text += f"• 🎵 <b>{artist}</b> - {title} <i>({format_duration(row['duration'])})</i>\n"
-        # Includes option to Play and option to Remove from playlist
+        # Option to Play and Remove from playlist
         keyboard.append([
             InlineKeyboardButton(f"▶️ Play {title[:16]}", callback_data=f"pl_play_{row['id']}"),
             InlineKeyboardButton("❌ Remove", callback_data=f"pl_rem_{row['id']}_{page}")
@@ -1108,7 +1275,7 @@ async def playlist_page_callback(update: Update, context: ContextTypes.DEFAULT_T
             await query.answer("Audio not found.", show_alert=True)
 
     elif data.startswith("pl_rem_"):
-        # Remove track from user's playlist
+        # Remove track from user's personal playlist
         parts = data.split("_")
         song_id = int(parts[2])
         page = int(parts[3])
@@ -1147,6 +1314,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "👋 <b>Welcome Admin!</b>\n\n"
             "Send <code>/adminmode</code> to manage music recording & broadcasts,\n"
             "<code>/skipall</code> to skip all duplicate songs,\n"
+            "<code>/sync</code> to restore or push database backups,\n"
             "<code>/pin</code> (in reply to a message) to post & pin to the channel,\n"
             "or <code>/playlist</code> to view your saved music.",
             parse_mode="HTML"
@@ -1201,6 +1369,7 @@ async def main():
     app.add_handler(CommandHandler("adminmodeoff", adminmodeoff_command))
     app.add_handler(CommandHandler("record", record_command))
     app.add_handler(CommandHandler("skipall", skipall_command))
+    app.add_handler(CommandHandler("sync", sync_command))
     app.add_handler(CommandHandler("over", over_command))
     app.add_handler(CommandHandler("stopbroadcast", stopbroadcast_command))
     app.add_handler(CommandHandler("status", status_command))
@@ -1220,6 +1389,9 @@ async def main():
     app.add_handler(MessageHandler(filters.AUDIO | filters.Document.AUDIO | filters.Document.FileExtension("mp3"), handle_audio_message))
 
     await app.initialize()
+
+    # Self-healing on startup: Auto-restores database if container was wiped
+    await auto_restore_on_boot(app.bot)
 
     # Web Server for Status + Admin File Manager
     web_app = web.Application()
@@ -1245,8 +1417,9 @@ async def main():
     )
     logger.info("🤖 Music Management Bot is actively polling!")
 
-    # Start Keep-Alive Pinger
+    # Start Background Workers
     pinger_task = asyncio.create_task(keep_alive_pinger())
+    backup_task = asyncio.create_task(backup_scheduler_worker(app.bot))
 
     # Graceful exit handling
     stop_signal = asyncio.Event()
@@ -1259,6 +1432,7 @@ async def main():
     # Cleanup
     logger.info("Shutting down bot...")
     pinger_task.cancel()
+    backup_task.cancel()
     await app.updater.stop()
     await app.stop()
     await app.shutdown()
