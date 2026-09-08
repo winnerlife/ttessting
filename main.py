@@ -7,6 +7,7 @@ import asyncio
 from aiohttp import web
 import aiohttp
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.error import BadRequest
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -35,6 +36,10 @@ def format_tg_id(raw_id: str | int) -> int:
 RECORDING_GROUP_ID = format_tg_id(os.environ.get("RECORDING_GROUP_ID", "-5309919588"))
 MUSIC_CHANNEL_ID = format_tg_id(os.environ.get("MUSIC_CHANNEL_ID", "-4448938519"))
 
+# Hardcoded Channel Username & Link
+CHANNEL_USERNAME = "Yourveryownplaylist"
+CHANNEL_URL = f"https://t.me/{CHANNEL_USERNAME}"
+
 DB_PATH = "music_bot.db"
 
 logging.basicConfig(
@@ -45,7 +50,8 @@ logger = logging.getLogger(__name__)
 
 # State tracking
 BROADCAST_ACTIVE = False
-ADMIN_MODE_USERS = set()  # Tracks active admin DM sessions
+ADMIN_MODE_USERS = set()
+BOT_USERNAME = None
 
 
 # ─────────────────────────────────────────────
@@ -84,6 +90,13 @@ def init_db():
             FOREIGN KEY(batch_id) REFERENCES batches(id)
         );
 
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            username TEXT,
+            first_name TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+
         CREATE TABLE IF NOT EXISTS user_playlists (
             user_id INTEGER NOT NULL,
             song_id INTEGER NOT NULL,
@@ -93,6 +106,18 @@ def init_db():
         );
         """)
     logger.info("✅ Database initialized successfully.")
+
+def register_user(user_id: int, username: str | None = None, first_name: str | None = None):
+    with get_db() as conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO users (user_id, username, first_name) VALUES (?, ?, ?)",
+            (user_id, username, first_name)
+        )
+
+def is_user_registered(user_id: int) -> bool:
+    with get_db() as conn:
+        row = conn.execute("SELECT 1 FROM users WHERE user_id = ?", (user_id,)).fetchone()
+        return row is not None
 
 
 # ─────────────────────────────────────────────
@@ -139,6 +164,46 @@ def is_recording_group(chat_id: int) -> bool:
     target_str = str(RECORDING_GROUP_ID).replace("-100", "-")
     return cid_str == str(RECORDING_GROUP_ID) or cid_str == target_str or cid_str.replace("-100", "-") == target_str
 
+async def get_bot_username(bot) -> str:
+    global BOT_USERNAME
+    if not BOT_USERNAME:
+        me = await bot.get_me()
+        BOT_USERNAME = me.username
+    return BOT_USERNAME
+
+async def is_user_subscribed(bot, user_id: int) -> bool:
+    """Checks if a user is an active member/admin of the music channel."""
+    if user_id == ADMIN_ID:
+        return True
+    try:
+        member = await bot.get_chat_member(chat_id=MUSIC_CHANNEL_ID, user_id=user_id)
+        return member.status in ("creator", "administrator", "member", "restricted")
+    except Exception as e:
+        logger.warning(f"Subscription verification error for user {user_id}: {e}")
+        return False
+
+async def send_fsub_gate(message_or_query, pending_song_id: int | None = None, edit: bool = False):
+    """Sends the forced subscription gate with the hardcoded join link and retry button."""
+    retry_data = f"check_sub_{pending_song_id}" if pending_song_id else "check_sub"
+    
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("📢 Join Music Channel", url=CHANNEL_URL)],
+        [InlineKeyboardButton("🔄 I've Joined / Try Again", callback_data=retry_data, api_kwargs={"style": "primary"})]
+    ])
+    
+    text = (
+        "👋 <b>Welcome to the Music Hub!</b>\n\n"
+        "To save songs, listen in high quality, and access your personal playlist, "
+        "please join our channel first.\n\n"
+        f"1️⃣ Tap <b>Join Music Channel</b> (@{CHANNEL_USERNAME})\n"
+        "2️⃣ Tap <b>I've Joined / Try Again</b> below"
+    )
+
+    if edit:
+        await message_or_query.edit_message_text(text, reply_markup=keyboard, parse_mode="HTML")
+    else:
+        await message_or_query.reply_text(text, reply_markup=keyboard, parse_mode="HTML")
+
 
 # ─────────────────────────────────────────────
 # Dynamic Web Dashboard & Keep-Alive Pinger
@@ -148,6 +213,7 @@ async def web_index(request):
         active_batch = conn.execute("SELECT id, genre FROM batches WHERE status = 'recording'").fetchone()
         total_songs = conn.execute("SELECT COUNT(*) as c FROM songs").fetchone()["c"]
         published = conn.execute("SELECT COUNT(*) as c FROM songs WHERE status = 'published'").fetchone()["c"]
+        users_count = conn.execute("SELECT COUNT(*) as c FROM users").fetchone()["c"]
 
     batch_str = f"Batch #{active_batch['id']} ({active_batch['genre']})" if active_batch else "None (Idle)"
     broadcast_badge = "🟢 Broadcasting" if BROADCAST_ACTIVE else "⚪ Idle"
@@ -187,6 +253,10 @@ async def web_index(request):
                 <div class="stat-val">{published}</div>
                 <div class="stat-lbl">Published Tracks</div>
             </div>
+            <div class="stat-box" style="grid-column: span 2;">
+                <div class="stat-val">{users_count}</div>
+                <div class="stat-lbl">Active Bot Subscribers</div>
+            </div>
         </div>
 
         <div class="tag">Active Batch: {batch_str}</div>
@@ -195,7 +265,6 @@ async def web_index(request):
 </body>
 </html>"""
     return web.Response(text=html, content_type="text/html")
-
 
 async def keep_alive_pinger():
     await asyncio.sleep(15)
@@ -233,6 +302,7 @@ async def adminmode_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• <b>Forward Songs Here</b> - Send/forward tracks directly to this chat!\n"
         "• <code>/over</code> - Close session & begin automatic publishing\n"
         "• <code>/stopbroadcast</code> - Pause or stop publishing\n"
+        "• <code>/pin</code> - Reply to any message to post & pin it to the channel with a 'Go listen' button\n"
         "• <code>/status</code> - View current batch & stats\n"
         "• <code>/adminmodeoff</code> - Exit admin mode",
         parse_mode="HTML"
@@ -247,11 +317,9 @@ async def adminmodeoff_command(update: Update, context: ContextTypes.DEFAULT_TYP
     ADMIN_MODE_USERS.discard(user.id)
     await update.message.reply_text("🔒 <b>Admin Mode: Deactivated</b>. Back to standard user mode.", parse_mode="HTML")
 
-
 async def record_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Starts a new recording batch for a specified genre."""
-    user_id = update.effective_user.id
-    if user_id != ADMIN_ID:
+    if update.effective_user.id != ADMIN_ID:
         return
 
     args = context.args
@@ -285,8 +353,7 @@ async def record_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def over_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Closes the recording session and starts publishing to the channel."""
     global BROADCAST_ACTIVE
-    user_id = update.effective_user.id
-    if user_id != ADMIN_ID:
+    if update.effective_user.id != ADMIN_ID:
         return
 
     with get_db() as conn:
@@ -337,6 +404,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         active_rec = conn.execute("SELECT * FROM batches WHERE status = 'recording'").fetchone()
         total_songs = conn.execute("SELECT COUNT(*) as c FROM songs").fetchone()["c"]
         published_songs = conn.execute("SELECT COUNT(*) as c FROM songs WHERE status = 'published'").fetchone()["c"]
+        total_users = conn.execute("SELECT COUNT(*) as c FROM users").fetchone()["c"]
 
     is_adm_mode = "🟢 Active" if update.effective_user.id in ADMIN_MODE_USERS else "⚪ Inactive"
 
@@ -345,9 +413,10 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"• <b>Admin Mode in DM:</b> {is_adm_mode}\n"
         f"• <b>Active Broadcast:</b> {'🟢 Running' if BROADCAST_ACTIVE else '⚪ Idle'}\n"
         f"• <b>Recording Group:</b> <code>{RECORDING_GROUP_ID}</code>\n"
-        f"• <b>Music Channel:</b> <code>{MUSIC_CHANNEL_ID}</code>\n"
+        f"• <b>Music Channel:</b> <code>{MUSIC_CHANNEL_ID}</code> (@{CHANNEL_USERNAME})\n"
         f"• <b>Total Songs in DB:</b> {total_songs}\n"
-        f"• <b>Total Published:</b> {published_songs}\n\n"
+        f"• <b>Total Published:</b> {published_songs}\n"
+        f"• <b>Registered Users:</b> {total_users}\n\n"
     )
 
     if active_rec:
@@ -356,6 +425,58 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         status_msg += "🎙️ <b>Active Batch:</b> None (Use /record <genre>)"
 
     await update.message.reply_text(status_msg, parse_mode="HTML")
+
+
+# ─────────────────────────────────────────────
+# Channel Pin Command (Admin only)
+# ─────────────────────────────────────────────
+async def pin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin command: copies the replied message to the channel with a 'Go listen' button and pins it."""
+    if update.effective_user.id != ADMIN_ID:
+        return
+
+    replied_msg = update.message.reply_to_message
+    if not replied_msg:
+        await update.message.reply_text(
+            "⚠️ <b>Usage:</b> Reply to any message you want to post and pin in the channel with <code>/pin</code>.",
+            parse_mode="HTML"
+        )
+        return
+
+    bot_user = await get_bot_username(context.bot)
+    listen_markup = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                text="🎧 Go listen",
+                url=f"https://t.me/{bot_user}",
+                api_kwargs={"style": "primary"}
+            )
+        ]
+    ])
+
+    try:
+        sent_channel_msg = await context.bot.copy_message(
+            chat_id=MUSIC_CHANNEL_ID,
+            from_chat_id=update.effective_chat.id,
+            message_id=replied_msg.message_id,
+            reply_markup=listen_markup
+        )
+
+        await context.bot.pin_chat_message(
+            chat_id=MUSIC_CHANNEL_ID,
+            message_id=sent_channel_msg.message_id
+        )
+
+        await update.message.reply_text(
+            "✅ <b>Message successfully posted and pinned in the channel!</b>",
+            parse_mode="HTML"
+        )
+    except BadRequest as e:
+        logger.error(f"Failed to post/pin message: {e}")
+        await update.message.reply_text(f"❌ <b>Telegram API Error:</b> {e.message}", parse_mode="HTML")
+    except Exception as e:
+        logger.error(f"Unexpected error in /pin: {e}")
+        await update.message.reply_text(f"❌ <b>Error:</b> {e}", parse_mode="HTML")
 
 
 # ─────────────────────────────────────────────
@@ -370,7 +491,6 @@ async def handle_audio_message(update: Update, context: ContextTypes.DEFAULT_TYP
     is_group = is_recording_group(msg.chat_id)
     is_dm_admin = msg.chat.type == "private" and msg.from_user.id == ADMIN_ID
 
-    # Only accept audio from recording group or direct admin DM
     if not (is_group or is_dm_admin):
         return
 
@@ -397,7 +517,6 @@ async def handle_audio_message(update: Update, context: ContextTypes.DEFAULT_TYP
     else:
         return
 
-    # Check for active recording batch
     with get_db() as conn:
         batch = conn.execute("SELECT id FROM batches WHERE status = 'recording'").fetchone()
         if not batch:
@@ -408,7 +527,6 @@ async def handle_audio_message(update: Update, context: ContextTypes.DEFAULT_TYP
         batch_id = batch["id"]
         norm = normalize_key(artist, title)
 
-        # Duplicate check across entire database
         existing = conn.execute(
             "SELECT id, artist, title FROM songs WHERE norm_key = ? AND status != 'skipped'",
             (norm,)
@@ -449,9 +567,7 @@ async def handle_audio_message(update: Update, context: ContextTypes.DEFAULT_TYP
             )
             logger.info(f"✅ Queued track #{next_order}: {artist} - {title}")
 
-
 async def duplicate_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Resolves duplicate review button clicks."""
     query = update.callback_query
     if query.from_user.id != ADMIN_ID:
         await query.answer("Admin only.", show_alert=True)
@@ -476,10 +592,8 @@ async def duplicate_callback_handler(update: Update, context: ContextTypes.DEFAU
 # Automated Channel Publishing Queue
 # ─────────────────────────────────────────────
 async def broadcast_worker(app: Application, batch_id: int, genre: str, notify_chat_id: int):
-    """Publishes queued songs one by one to the music channel."""
     global BROADCAST_ACTIVE
     logger.info(f"Starting broadcast for Batch #{batch_id}")
-
     published_count = 0
 
     while BROADCAST_ACTIVE:
@@ -532,8 +646,6 @@ async def broadcast_worker(app: Application, batch_id: int, genre: str, notify_c
                     (sent_msg.message_id, song_id)
                 )
             published_count += 1
-
-            # Prevent Telegram 429 Flood Limits (post every 2.5s)
             await asyncio.sleep(2.5)
 
         except Exception as e:
@@ -546,7 +658,6 @@ async def broadcast_worker(app: Application, batch_id: int, genre: str, notify_c
 
     BROADCAST_ACTIVE = False
     
-    # Notify admin directly in DM/chat where /over was sent
     await app.bot.send_message(
         chat_id=notify_chat_id,
         text=f"🏁 <b>Broadcast finished for Batch #{batch_id}!</b>\n"
@@ -557,14 +668,26 @@ async def broadcast_worker(app: Application, batch_id: int, genre: str, notify_c
 
 
 # ─────────────────────────────────────────────
-# Subscriber Playlist Management
+# Subscriber Playlist & Membership Gate Handlers
 # ─────────────────────────────────────────────
 async def add_to_playlist_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handles channel subscribers clicking 'Add to Playlist'."""
+    """
+    Handles 'Add to Playlist' button clicks in the channel.
+    If the user has not started the bot, redirects them via deep link.
+    """
     query = update.callback_query
-    user_id = query.from_user.id
+    user = query.from_user
+    user_id = user.id
     song_id = int(query.data.replace("pl_add_", ""))
+    bot_user = await get_bot_username(context.bot)
 
+    # If the user has never started the bot in DM, redirect them with a deep link
+    if not is_user_registered(user_id):
+        redirect_url = f"https://t.me/{bot_user}?start=save_{song_id}"
+        await query.answer(url=redirect_url)
+        return
+
+    # User is registered: save immediately and give in-app feedback
     with get_db() as conn:
         already_saved = conn.execute(
             "SELECT 1 FROM user_playlists WHERE user_id = ? AND song_id = ?",
@@ -582,17 +705,66 @@ async def add_to_playlist_callback(update: Update, context: ContextTypes.DEFAULT
 
     await query.answer("Added to your playlist! ⭐ Check your private chat with the bot.", show_alert=False)
 
+async def check_sub_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles the 'Try Again' button when a user verifies their channel membership."""
+    query = update.callback_query
+    user = query.from_user
+    data = query.data
+
+    pending_song_id = None
+    if data.startswith("check_sub_"):
+        try:
+            pending_song_id = int(data.replace("check_sub_", ""))
+        except ValueError:
+            pending_song_id = None
+
+    is_sub = await is_user_subscribed(context.bot, user.id)
+    if not is_sub:
+        await query.answer("⚠️ You haven't joined the channel yet! Please join first.", show_alert=True)
+        return
+
+    register_user(user.id, user.username, user.first_name)
+    await query.answer("✅ Channel membership verified!")
+
+    if pending_song_id:
+        with get_db() as conn:
+            conn.execute(
+                "INSERT OR IGNORE INTO user_playlists (user_id, song_id) VALUES (?, ?)",
+                (user.id, pending_song_id)
+            )
+            song = conn.execute("SELECT artist, title FROM songs WHERE id = ?", (pending_song_id,)).fetchone()
+
+        song_info = f"<b>{song['artist']} - {song['title']}</b>" if song else "the selected track"
+        await query.edit_message_text(
+            f"🎉 <b>Welcome!</b>\n\n"
+            f"✅ We saved {song_info} to your personal playlist!\n\n"
+            f"Send <code>/playlist</code> anytime to view and stream your tracks.",
+            parse_mode="HTML"
+        )
+    else:
+        await query.edit_message_text(
+            "👋 <b>Welcome to the Music Hub!</b>\n\n"
+            "• Tap <b>Add to Playlist</b> under any track in our channel to save it.\n"
+            "• Send <code>/playlist</code> here to view and play your saved songs.",
+            parse_mode="HTML"
+        )
 
 async def user_playlist_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Displays saved songs in user's private chat."""
+    """Displays saved songs in user's private chat after verifying subscription."""
     if update.effective_chat.type != "private":
         await update.message.reply_text("Please check your playlist in my private chat! 🎧")
         return
 
-    user_id = update.effective_user.id
-    page = 1
-    await render_playlist_page(update.message, user_id, page)
+    user = update.effective_user
+    register_user(user.id, user.username, user.first_name)
 
+    # Enforce channel subscription check
+    if not await is_user_subscribed(context.bot, user.id):
+        await send_fsub_gate(update.message)
+        return
+
+    page = 1
+    await render_playlist_page(update.message, user.id, page)
 
 async def render_playlist_page(message, user_id: int, page: int, edit=False):
     limit = 5
@@ -649,7 +821,6 @@ async def render_playlist_page(message, user_id: int, page: int, edit=False):
     else:
         await message.reply_text(text, reply_markup=reply_markup, parse_mode="HTML")
 
-
 async def playlist_page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     data = query.data
@@ -676,15 +847,53 @@ async def playlist_page_callback(update: Update, context: ContextTypes.DEFAULT_T
         else:
             await query.answer("Audio not found.", show_alert=True)
 
-
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Welcome handler."""
+    """Handles /start, deep-link playlist additions, and enforces channel subscription."""
     user = update.effective_user
+    args = context.args
+
+    # Check for deep-linked song: /start save_<song_id>
+    pending_song_id = None
+    if args and args[0].startswith("save_"):
+        try:
+            pending_song_id = int(args[0].replace("save_", ""))
+        except ValueError:
+            pending_song_id = None
+
+    # Admin bypass
     if user.id == ADMIN_ID:
+        register_user(user.id, user.username, user.first_name)
         await update.message.reply_text(
             "👋 <b>Welcome Admin!</b>\n\n"
             "Send <code>/adminmode</code> to manage music recording & broadcasts,\n"
-            "or <code>/playlist</code> to view your saved personal music.",
+            "<code>/pin</code> (in reply to a message) to post & pin to the channel,\n"
+            "or <code>/playlist</code> to view your saved music.",
+            parse_mode="HTML"
+        )
+        return
+
+    # Check if subscriber is in the channel
+    subscribed = await is_user_subscribed(context.bot, user.id)
+    if not subscribed:
+        await send_fsub_gate(update.message, pending_song_id=pending_song_id)
+        return
+
+    # User is confirmed subscribed
+    register_user(user.id, user.username, user.first_name)
+
+    if pending_song_id:
+        with get_db() as conn:
+            conn.execute(
+                "INSERT OR IGNORE INTO user_playlists (user_id, song_id) VALUES (?, ?)",
+                (user.id, pending_song_id)
+            )
+            song = conn.execute("SELECT artist, title FROM songs WHERE id = ?", (pending_song_id,)).fetchone()
+
+        song_info = f"<b>{song['artist']} - {song['title']}</b>" if song else "the selected track"
+        await update.message.reply_text(
+            f"🎉 <b>Welcome to the Music Hub!</b>\n\n"
+            f"✅ We added {song_info} to your personal playlist.\n"
+            f"Send <code>/playlist</code> here anytime to view and play your songs.",
             parse_mode="HTML"
         )
     else:
@@ -715,6 +924,7 @@ async def main():
     app.add_handler(CommandHandler("over", over_command))
     app.add_handler(CommandHandler("stopbroadcast", stopbroadcast_command))
     app.add_handler(CommandHandler("status", status_command))
+    app.add_handler(CommandHandler("pin", pin_command))
 
     # User Handlers
     app.add_handler(CommandHandler("start", start_command))
@@ -723,6 +933,7 @@ async def main():
     # Callbacks
     app.add_handler(CallbackQueryHandler(duplicate_callback_handler, pattern=r"^dup_"))
     app.add_handler(CallbackQueryHandler(add_to_playlist_callback, pattern=r"^pl_add_"))
+    app.add_handler(CallbackQueryHandler(check_sub_callback, pattern=r"^check_sub"))
     app.add_handler(CallbackQueryHandler(playlist_page_callback, pattern=r"^pl_(page|play)_"))
 
     # Audio message listener (handles native Audio & audio Files/Documents)
@@ -730,7 +941,7 @@ async def main():
 
     await app.initialize()
 
-    # Web Server for EthioDeploy / Render Keep-Alive
+    # Web Server for Keep-Alive
     web_app = web.Application()
     web_app.router.add_get("/", web_index)
     runner = web.AppRunner(web_app)
