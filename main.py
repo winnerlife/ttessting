@@ -4,6 +4,9 @@ import signal
 import sqlite3
 import logging
 import asyncio
+import base64
+import html
+from datetime import datetime
 from aiohttp import web
 import aiohttp
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -26,6 +29,10 @@ APP_URL = os.environ.get("APP_URL")
 
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "7429996344"))
 
+# Web Admin Authentication Credentials
+WEB_ADMIN_USER = os.environ.get("ADMIN", "admin")
+WEB_ADMIN_PASS = os.environ.get("PASS", "admin123")
+
 def format_tg_id(raw_id: str | int) -> int:
     """Ensures supergroups and channels have the required -100 prefix."""
     val = int(raw_id)
@@ -36,11 +43,12 @@ def format_tg_id(raw_id: str | int) -> int:
 RECORDING_GROUP_ID = format_tg_id(os.environ.get("RECORDING_GROUP_ID", "-5309919588"))
 MUSIC_CHANNEL_ID = format_tg_id(os.environ.get("MUSIC_CHANNEL_ID", "-4448938519"))
 
-# Hardcoded Channel Username & Link
+# Channel Username & Link
 CHANNEL_USERNAME = "Yourveryownplaylist"
 CHANNEL_URL = f"https://t.me/{CHANNEL_USERNAME}"
 
 DB_PATH = "music_bot.db"
+BASE_DIR = os.path.abspath(os.getcwd())
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -139,25 +147,13 @@ def format_duration(seconds: int | None) -> str:
     mins, secs = divmod(seconds, 60)
     return f"{mins}:{secs:02d}"
 
-def generate_caption(artist: str | None, title: str | None, album: str | None, duration: int | None, genre: str) -> str:
-    art = artist or "Unknown Artist"
-    tit = title or "Unknown Track"
-    
-    caption = (
-        f"🎵 <b>Track:</b> {tit}\n"
-        f"👤 <b>Artist:</b> {art}\n"
-    )
-    if album:
-        caption += f"💿 <b>Album:</b> {album}\n"
-    caption += f"⏱ <b>Duration:</b> {format_duration(duration)}\n\n"
-
-    tags = [make_hashtag(genre), make_hashtag(art)]
+def generate_caption(artist: str | None, album: str | None, genre: str) -> str:
+    """Generates only hashtags for the channel post as requested."""
+    tags = [make_hashtag(genre), make_hashtag(artist)]
     if album:
         tags.append(make_hashtag(album))
     tags.append("#Music")
-    
-    caption += " ".join([t for t in tags if t])
-    return caption
+    return " ".join([t for t in tags if t]).strip()
 
 def is_recording_group(chat_id: int) -> bool:
     cid_str = str(chat_id)
@@ -183,7 +179,7 @@ async def is_user_subscribed(bot, user_id: int) -> bool:
         return False
 
 async def send_fsub_gate(message_or_query, pending_song_id: int | None = None, edit: bool = False):
-    """Sends the forced subscription gate with the hardcoded join link and retry button."""
+    """Sends the forced subscription gate with the channel join link."""
     retry_data = f"check_sub_{pending_song_id}" if pending_song_id else "check_sub"
     
     keyboard = InlineKeyboardMarkup([
@@ -206,6 +202,261 @@ async def send_fsub_gate(message_or_query, pending_song_id: int | None = None, e
 
 
 # ─────────────────────────────────────────────
+# Web Admin File Manager (Auth Protected)
+# ─────────────────────────────────────────────
+def check_web_auth(request: web.Request) -> bool:
+    """Validates HTTP Basic Auth credentials against ADMIN and PASS."""
+    auth_header = request.headers.get("Authorization")
+    if not auth_header or not auth_header.startswith("Basic "):
+        return False
+    try:
+        token = auth_header[6:].strip()
+        decoded = base64.b64decode(token).decode("utf-8")
+        username, password = decoded.split(":", 1)
+        return username == WEB_ADMIN_USER and password == WEB_ADMIN_PASS
+    except Exception:
+        return False
+
+def auth_required(handler):
+    async def middleware(request):
+        if not check_web_auth(request):
+            return web.Response(
+                status=401,
+                text="Unauthorized Access. Please supply valid credentials.",
+                headers={"WWW-Authenticate": 'Basic realm="Bot Admin File Manager"'}
+            )
+        return await handler(request)
+    return middleware
+
+def safe_rel_path(rel_path: str = "") -> str | None:
+    """Prevents directory traversal outside project root."""
+    clean = rel_path.strip().lstrip("/\\")
+    full_path = os.path.abspath(os.path.join(BASE_DIR, clean))
+    if not full_path.startswith(BASE_DIR):
+        return None
+    return full_path
+
+def format_file_size(size: int) -> str:
+    if size < 1024:
+        return f"{size} B"
+    elif size < 1024 * 1024:
+        return f"{size / 1024:.1f} KB"
+    return f"{size / (1024 * 1024):.1f} MB"
+
+@auth_required
+async def admin_files_page(request: web.Request):
+    subpath = request.query.get("p", "").strip()
+    target_dir = safe_rel_path(subpath)
+
+    if not target_dir or not os.path.exists(target_dir):
+        return web.Response(text="Directory not found", status=404)
+
+    rel_current = os.path.relpath(target_dir, BASE_DIR)
+    if rel_current == ".":
+        rel_current = ""
+
+    items = []
+    try:
+        entries = sorted(os.listdir(target_dir))
+    except Exception as e:
+        return web.Response(text=f"Error reading directory: {e}", status=500)
+
+    for entry in entries:
+        full_item_path = os.path.join(target_dir, entry)
+        is_dir = os.path.isdir(full_item_path)
+        item_rel = os.path.relpath(full_item_path, BASE_DIR)
+        stat = os.stat(full_item_path)
+        mtime = datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M")
+        size_str = format_file_size(stat.st_size) if not is_dir else "DIR"
+        items.append({
+            "name": entry,
+            "is_dir": is_dir,
+            "rel": item_rel,
+            "size": size_str,
+            "mtime": mtime
+        })
+
+    parent_link = ""
+    if rel_current:
+        parent_rel = os.path.dirname(rel_current)
+        parent_link = f'<a href="/admin?p={parent_rel}" class="btn">⬅️ Back to Parent Directory</a>'
+
+    rows_html = ""
+    for item in items:
+        if item["is_dir"]:
+            icon = "📁"
+            name_cell = f'<a href="/admin?p={item["rel"]}" class="dir-link">{icon} <b>{html.escape(item["name"])}/</b></a>'
+            actions = "-"
+        else:
+            icon = "📄"
+            name_cell = f'{icon} {html.escape(item["name"])}'
+            actions = (
+                f'<a href="/admin/download?p={item["rel"]}" class="btn-sm btn-dl">⬇️ Download</a> '
+                f'<a href="/admin/edit?p={item["rel"]}" class="btn-sm btn-edit">✏️ Edit</a>'
+            )
+
+        rows_html += f"""
+        <tr>
+            <td>{name_cell}</td>
+            <td>{item['size']}</td>
+            <td>{item['mtime']}</td>
+            <td>{actions}</td>
+        </tr>
+        """
+
+    html_content = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Admin File Manager</title>
+    <style>
+        body {{ background:#0f172a; color:#e2e8f0; font-family:system-ui,sans-serif; margin:0; padding:20px; }}
+        .container {{ max-width:1050px; margin:0 auto; background:#1e293b; padding:24px; border-radius:14px; box-shadow:0 10px 30px rgba(0,0,0,0.5); }}
+        h1 {{ color:#38bdf8; margin-top:0; }}
+        .breadcrumb {{ background:#334155; padding:10px 14px; border-radius:8px; font-family:monospace; margin-bottom:16px; word-break:break-all; }}
+        table {{ width:100%; border-collapse:collapse; margin-top:16px; }}
+        th, td {{ padding:12px; text-align:left; border-bottom:1px solid #334155; }}
+        th {{ background:#0f172a; color:#94a3b8; font-size:0.9em; }}
+        a {{ color:#38bdf8; text-decoration:none; }}
+        a:hover {{ text-decoration:underline; }}
+        .btn {{ display:inline-block; padding:8px 14px; background:#38bdf8; color:#0f172a; font-weight:bold; border-radius:6px; text-decoration:none; margin-bottom:14px; }}
+        .btn-sm {{ display:inline-block; padding:4px 8px; border-radius:4px; font-size:0.8em; font-weight:600; text-decoration:none; margin-right:4px; }}
+        .btn-dl {{ background:#10b981; color:#fff; }}
+        .btn-edit {{ background:#6366f1; color:#fff; }}
+        .upload-box {{ background:#0f172a; padding:16px; border-radius:8px; margin-top:24px; border:1px dashed #475569; }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🗂️ Admin File Manager</h1>
+        <div class="breadcrumb"><b>Path:</b> /{html.escape(rel_current)}</div>
+        {parent_link}
+        <table>
+            <thead>
+                <tr>
+                    <th>Name</th>
+                    <th>Size</th>
+                    <th>Last Modified</th>
+                    <th>Actions</th>
+                </tr>
+            </thead>
+            <tbody>
+                {rows_html}
+            </tbody>
+        </table>
+
+        <div class="upload-box">
+            <h3>📤 Upload File into this Directory</h3>
+            <form action="/admin/upload?p={rel_current}" method="post" enctype="multipart/form-data">
+                <input type="file" name="file" required style="color:#94a3b8;">
+                <button type="submit" class="btn" style="margin:0; cursor:pointer; padding:6px 14px;">Upload</button>
+            </form>
+        </div>
+    </div>
+</body>
+</html>"""
+    return web.Response(text=html_content, content_type="text/html")
+
+@auth_required
+async def admin_download_file(request: web.Request):
+    subpath = request.query.get("p", "").strip()
+    target_file = safe_rel_path(subpath)
+
+    if not target_file or not os.path.isfile(target_file):
+        return web.Response(text="File not found", status=404)
+
+    return web.FileResponse(
+        path=target_file,
+        headers={"Content-Disposition": f'attachment; filename="{os.path.basename(target_file)}"'}
+    )
+
+@auth_required
+async def admin_edit_file_get(request: web.Request):
+    subpath = request.query.get("p", "").strip()
+    target_file = safe_rel_path(subpath)
+
+    if not target_file or not os.path.isfile(target_file):
+        return web.Response(text="File not found", status=404)
+
+    try:
+        with open(target_file, "r", encoding="utf-8", errors="replace") as f:
+            content = f.read()
+    except Exception as e:
+        return web.Response(text=f"Cannot read file: {e}", status=500)
+
+    html_content = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Editing: {html.escape(os.path.basename(target_file))}</title>
+    <style>
+        body {{ background:#0f172a; color:#e2e8f0; font-family:system-ui,sans-serif; margin:0; padding:20px; }}
+        .container {{ max-width:1050px; margin:0 auto; background:#1e293b; padding:24px; border-radius:12px; }}
+        textarea {{ width:100%; height:550px; background:#0f172a; color:#f8fafc; font-family:Consolas,monospace; font-size:14px; padding:12px; border:1px solid #334155; border-radius:8px; box-sizing:border-box; }}
+        .btn {{ padding:10px 18px; border-radius:6px; font-weight:bold; cursor:pointer; text-decoration:none; display:inline-block; border:none; }}
+        .btn-save {{ background:#10b981; color:#fff; margin-right:10px; }}
+        .btn-back {{ background:#475569; color:#fff; }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h2>✏️ Editing: <code>/{html.escape(subpath)}</code></h2>
+        <form method="post" action="/admin/edit?p={subpath}">
+            <textarea name="content">{html.escape(content)}</textarea>
+            <div style="margin-top:14px;">
+                <button type="submit" class="btn btn-save">💾 Save Changes</button>
+                <a href="/admin?p={os.path.dirname(subpath)}" class="btn btn-back">Cancel</a>
+            </div>
+        </form>
+    </div>
+</body>
+</html>"""
+    return web.Response(text=html_content, content_type="text/html")
+
+@auth_required
+async def admin_edit_file_post(request: web.Request):
+    subpath = request.query.get("p", "").strip()
+    target_file = safe_rel_path(subpath)
+
+    if not target_file or not os.path.isfile(target_file):
+        return web.Response(text="File not found", status=404)
+
+    data = await request.post()
+    new_content = data.get("content", "")
+
+    try:
+        with open(target_file, "w", encoding="utf-8") as f:
+            f.write(new_content)
+    except Exception as e:
+        return web.Response(text=f"Failed to write file: {e}", status=500)
+
+    raise web.HTTPFound(location=f"/admin?p={os.path.dirname(subpath)}")
+
+@auth_required
+async def admin_upload_file(request: web.Request):
+    subpath = request.query.get("p", "").strip()
+    target_dir = safe_rel_path(subpath)
+
+    if not target_dir or not os.path.isdir(target_dir):
+        return web.Response(text="Directory not found", status=404)
+
+    reader = await request.multipart()
+    field = await reader.next()
+    if field and field.name == "file":
+        filename = os.path.basename(field.filename)
+        dest_path = os.path.join(target_dir, filename)
+        with open(dest_path, "wb") as f:
+            while True:
+                chunk = await field.read_chunk()
+                if not chunk:
+                    break
+                f.write(chunk)
+
+    raise web.HTTPFound(location=f"/admin?p={subpath}")
+
+
+# ─────────────────────────────────────────────
 # Dynamic Web Dashboard & Keep-Alive Pinger
 # ─────────────────────────────────────────────
 async def web_index(request):
@@ -218,7 +469,7 @@ async def web_index(request):
     batch_str = f"Batch #{active_batch['id']} ({active_batch['genre']})" if active_batch else "None (Idle)"
     broadcast_badge = "🟢 Broadcasting" if BROADCAST_ACTIVE else "⚪ Idle"
 
-    html = f"""<!DOCTYPE html>
+    html_page = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
@@ -236,13 +487,14 @@ async def web_index(request):
         .stat-val {{ font-size:1.3em; font-weight:bold; color:#f8fafc; }}
         .stat-lbl {{ font-size:0.8em; color:#94a3b8; }}
         .tag {{ display:inline-block; background:#1e1b4b; color:#c7d2fe; padding:6px 14px; border-radius:20px; font-size:0.85em; font-weight:600; }}
+        .admin-link {{ display:block; margin-top:20px; color:#38bdf8; font-size:0.9em; text-decoration:none; }}
     </style>
 </head>
 <body>
     <div class="card">
         <h1>🎧 Music Service Bot</h1>
         <div class="status"><div class="dot"></div> Online & Polling Telegram</div>
-        <p>Zero-download music management, deduplication pipeline, and automated channel broadcast engine.</p>
+        <p>Automated music pipeline, channel broadcasting, and subscriber playlist engine.</p>
         
         <div class="stats">
             <div class="stat-box">
@@ -261,10 +513,11 @@ async def web_index(request):
 
         <div class="tag">Active Batch: {batch_str}</div>
         <div class="tag" style="margin-top:8px;background:#334155;color:#f1f5f9;">Queue: {broadcast_badge}</div>
+        <a href="/admin" class="admin-link">🔒 Open File Manager & DB Browser</a>
     </div>
 </body>
 </html>"""
-    return web.Response(text=html, content_type="text/html")
+    return web.Response(text=html_page, content_type="text/html")
 
 async def keep_alive_pinger():
     await asyncio.sleep(15)
@@ -300,6 +553,7 @@ async def adminmode_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "You can now manage the bot directly from here:\n"
         "• <code>/record &lt;genre&gt;</code> - Open a recording session (e.g. <code>/record rnb</code>)\n"
         "• <b>Forward Songs Here</b> - Send/forward tracks directly to this chat!\n"
+        "• <code>/skipall</code> - Skip all pending duplicate tracks at once\n"
         "• <code>/over</code> - Close session & begin automatic publishing\n"
         "• <code>/stopbroadcast</code> - Pause or stop publishing\n"
         "• <code>/pin</code> - Reply to any message to post & pin it to the channel with a 'Go listen' button\n"
@@ -346,7 +600,22 @@ async def record_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🎙️ <b>Recording Session #{batch_id} Started!</b>\n"
         f"• <b>Genre:</b> #{make_hashtag(genre)[1:]}\n\n"
         f"👉 <b>Forward songs directly here</b> (or into the group).\n"
+        f"👉 Send <code>/skipall</code> at any time to skip duplicate warnings.\n"
         f"👉 Send <code>/over</code> when finished to begin channel broadcast.",
+        parse_mode="HTML"
+    )
+
+async def skipall_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin command: Skips all songs that are in duplicate_pending status."""
+    if update.effective_user.id != ADMIN_ID:
+        return
+
+    with get_db() as conn:
+        cur = conn.execute("UPDATE songs SET status = 'skipped' WHERE status = 'duplicate_pending'")
+        skipped_count = cur.rowcount
+
+    await update.message.reply_text(
+        f"🚫 <b>Skipped {skipped_count} duplicate song(s).</b>",
         parse_mode="HTML"
     )
 
@@ -426,10 +695,6 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(status_msg, parse_mode="HTML")
 
-
-# ─────────────────────────────────────────────
-# Channel Pin Command (Admin only)
-# ─────────────────────────────────────────────
 async def pin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Admin command: copies the replied message to the channel with a 'Go listen' button and pins it."""
     if update.effective_user.id != ADMIN_ID:
@@ -555,7 +820,7 @@ async def handle_audio_message(update: Update, context: ContextTypes.DEFAULT_TYP
             await msg.reply_text(
                 f"⚠️ <b>Duplicate Detected</b>\n"
                 f"🎵 <b>{artist} - {title}</b> already exists in DB.\n"
-                f"Action for track #{next_order}:",
+                f"Action for track #{next_order} (or send <code>/skipall</code>):",
                 reply_markup=InlineKeyboardMarkup(buttons),
                 parse_mode="HTML"
             )
@@ -610,11 +875,10 @@ async def broadcast_worker(app: Application, batch_id: int, genre: str, notify_c
             break
 
         song_id = song["id"]
+        # Generated caption contains ONLY the hashtags
         caption = generate_caption(
             artist=song["artist"],
-            title=song["title"],
             album=song["album"],
-            duration=song["duration"],
             genre=genre
         )
 
@@ -671,23 +935,18 @@ async def broadcast_worker(app: Application, batch_id: int, genre: str, notify_c
 # Subscriber Playlist & Membership Gate Handlers
 # ─────────────────────────────────────────────
 async def add_to_playlist_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Handles 'Add to Playlist' button clicks in the channel.
-    If the user has not started the bot, redirects them via deep link.
-    """
+    """Handles 'Add to Playlist' button clicks in the channel."""
     query = update.callback_query
     user = query.from_user
     user_id = user.id
     song_id = int(query.data.replace("pl_add_", ""))
     bot_user = await get_bot_username(context.bot)
 
-    # If the user has never started the bot in DM, redirect them with a deep link
     if not is_user_registered(user_id):
         redirect_url = f"https://t.me/{bot_user}?start=save_{song_id}"
         await query.answer(url=redirect_url)
         return
 
-    # User is registered: save immediately and give in-app feedback
     with get_db() as conn:
         already_saved = conn.execute(
             "SELECT 1 FROM user_playlists WHERE user_id = ? AND song_id = ?",
@@ -758,7 +1017,6 @@ async def user_playlist_command(update: Update, context: ContextTypes.DEFAULT_TY
     user = update.effective_user
     register_user(user.id, user.username, user.first_name)
 
-    # Enforce channel subscription check
     if not await is_user_subscribed(context.bot, user.id):
         await send_fsub_gate(update.message)
         return
@@ -789,9 +1047,9 @@ async def render_playlist_page(message, user_id: int, page: int, edit=False):
     if total == 0:
         text = "🎧 <b>Your playlist is empty!</b>\n\nTap the green <b>Add to Playlist</b> button under any song in our channel to save it here."
         if edit:
-            await message.edit_text(text, parse_mode="HTML")
+            await message.edit_text(text, reply_markup=None, parse_mode="HTML")
         else:
-            await message.reply_text(text, parse_mode="HTML")
+            await message.reply_text(text, reply_markup=None, parse_mode="HTML")
         return
 
     total_pages = (total + limit - 1) // limit
@@ -802,8 +1060,10 @@ async def render_playlist_page(message, user_id: int, page: int, edit=False):
         artist = row["artist"] or "Unknown"
         title = row["title"] or "Track"
         text += f"• 🎵 <b>{artist}</b> - {title} <i>({format_duration(row['duration'])})</i>\n"
+        # Includes option to Play and option to Remove from playlist
         keyboard.append([
-            InlineKeyboardButton(f"▶️ Play {title[:20]}", callback_data=f"pl_play_{row['id']}")
+            InlineKeyboardButton(f"▶️ Play {title[:16]}", callback_data=f"pl_play_{row['id']}"),
+            InlineKeyboardButton("❌ Remove", callback_data=f"pl_rem_{row['id']}_{page}")
         ])
 
     nav_buttons = []
@@ -847,12 +1107,33 @@ async def playlist_page_callback(update: Update, context: ContextTypes.DEFAULT_T
         else:
             await query.answer("Audio not found.", show_alert=True)
 
+    elif data.startswith("pl_rem_"):
+        # Remove track from user's playlist
+        parts = data.split("_")
+        song_id = int(parts[2])
+        page = int(parts[3])
+
+        with get_db() as conn:
+            conn.execute(
+                "DELETE FROM user_playlists WHERE user_id = ? AND song_id = ?",
+                (user_id, song_id)
+            )
+            total = conn.execute(
+                "SELECT COUNT(*) as c FROM user_playlists WHERE user_id = ?",
+                (user_id,)
+            ).fetchone()["c"]
+
+        await query.answer("Track removed from your playlist 🗑️")
+        limit = 5
+        max_page = max(1, (total + limit - 1) // limit)
+        target_page = min(page, max_page)
+        await render_playlist_page(query.message, user_id, target_page, edit=True)
+
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handles /start, deep-link playlist additions, and enforces channel subscription."""
     user = update.effective_user
     args = context.args
 
-    # Check for deep-linked song: /start save_<song_id>
     pending_song_id = None
     if args and args[0].startswith("save_"):
         try:
@@ -860,25 +1141,23 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except ValueError:
             pending_song_id = None
 
-    # Admin bypass
     if user.id == ADMIN_ID:
         register_user(user.id, user.username, user.first_name)
         await update.message.reply_text(
             "👋 <b>Welcome Admin!</b>\n\n"
             "Send <code>/adminmode</code> to manage music recording & broadcasts,\n"
+            "<code>/skipall</code> to skip all duplicate songs,\n"
             "<code>/pin</code> (in reply to a message) to post & pin to the channel,\n"
             "or <code>/playlist</code> to view your saved music.",
             parse_mode="HTML"
         )
         return
 
-    # Check if subscriber is in the channel
     subscribed = await is_user_subscribed(context.bot, user.id)
     if not subscribed:
         await send_fsub_gate(update.message, pending_song_id=pending_song_id)
         return
 
-    # User is confirmed subscribed
     register_user(user.id, user.username, user.first_name)
 
     if pending_song_id:
@@ -921,6 +1200,7 @@ async def main():
     app.add_handler(CommandHandler("adminmode", adminmode_command))
     app.add_handler(CommandHandler("adminmodeoff", adminmodeoff_command))
     app.add_handler(CommandHandler("record", record_command))
+    app.add_handler(CommandHandler("skipall", skipall_command))
     app.add_handler(CommandHandler("over", over_command))
     app.add_handler(CommandHandler("stopbroadcast", stopbroadcast_command))
     app.add_handler(CommandHandler("status", status_command))
@@ -934,21 +1214,28 @@ async def main():
     app.add_handler(CallbackQueryHandler(duplicate_callback_handler, pattern=r"^dup_"))
     app.add_handler(CallbackQueryHandler(add_to_playlist_callback, pattern=r"^pl_add_"))
     app.add_handler(CallbackQueryHandler(check_sub_callback, pattern=r"^check_sub"))
-    app.add_handler(CallbackQueryHandler(playlist_page_callback, pattern=r"^pl_(page|play)_"))
+    app.add_handler(CallbackQueryHandler(playlist_page_callback, pattern=r"^pl_(page|play|rem)_"))
 
-    # Audio message listener (handles native Audio & audio Files/Documents)
+    # Audio message listener
     app.add_handler(MessageHandler(filters.AUDIO | filters.Document.AUDIO | filters.Document.FileExtension("mp3"), handle_audio_message))
 
     await app.initialize()
 
-    # Web Server for Keep-Alive
+    # Web Server for Status + Admin File Manager
     web_app = web.Application()
     web_app.router.add_get("/", web_index)
+    web_app.router.add_get("/admin", admin_files_page)
+    web_app.router.add_get("/admin/download", admin_download_file)
+    web_app.router.add_get("/admin/edit", admin_edit_file_get)
+    web_app.router.add_post("/admin/edit", admin_edit_file_post)
+    web_app.router.add_post("/admin/upload", admin_upload_file)
+
     runner = web.AppRunner(web_app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
     logger.info(f"🚀 Web Server started on port {PORT}")
+    logger.info(f"🔒 Admin File Manager running at /admin with user '{WEB_ADMIN_USER}'")
 
     # Start Telegram Polling
     await app.start()
