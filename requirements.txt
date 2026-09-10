@@ -4,3 +4,4 @@ Pillow>=10.0
 python-telegram-bot[job-queue]
 aiosqlite
 python-dotenv
+supabase>=2.4.0
