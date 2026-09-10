@@ -1,14 +1,13 @@
 import os
 import re
 import signal
-import sqlite3
 import logging
 import asyncio
-import base64
 import html
 from datetime import datetime
 from aiohttp import web
 import aiohttp
+from supabase import create_async_client, AsyncClient
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.error import BadRequest
 from telegram.ext import (
@@ -28,28 +27,20 @@ PORT = int(os.environ.get("PORT", "8080"))
 APP_URL = os.environ.get("APP_URL")
 
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "7429996344"))
-
-# Web Admin Authentication Credentials
-WEB_ADMIN_USER = os.environ.get("ADMIN", "admin")
-WEB_ADMIN_PASS = os.environ.get("PASS", "admin123")
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "https://zrwbwtzduhgmtszzleot.supabase.co")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
 
 def format_tg_id(raw_id: str | int) -> int:
-    """Ensures supergroups and channels have the required -100 prefix."""
     val = int(raw_id)
     if val < 0 and not str(val).startswith("-100"):
         return int(f"-100{abs(val)}")
     return val
 
 RECORDING_GROUP_ID = format_tg_id(os.environ.get("RECORDING_GROUP_ID", "-5309919588"))
-BACKUP_GROUP_ID = format_tg_id(os.environ.get("BACKUP_GROUP_ID", "-5309919588"))
 MUSIC_CHANNEL_ID = format_tg_id(os.environ.get("MUSIC_CHANNEL_ID", "-4448938519"))
 
-# Channel Username & Link
 CHANNEL_USERNAME = "Yourveryownplaylist"
 CHANNEL_URL = f"https://t.me/{CHANNEL_USERNAME}"
-
-DB_PATH = "music_bot.db"
-BASE_DIR = os.path.abspath(os.getcwd())
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -57,77 +48,11 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# State tracking
+# Global Runtime State
 BROADCAST_ACTIVE = False
 ADMIN_MODE_USERS = set()
 BOT_USERNAME = None
-
-
-# ─────────────────────────────────────────────
-# Database Layer (SQLite with WAL mode)
-# ─────────────────────────────────────────────
-def get_db():
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=15)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL;")
-    conn.execute("PRAGMA busy_timeout = 5000;")
-    return conn
-
-def init_db():
-    with get_db() as conn:
-        conn.executescript("""
-        CREATE TABLE IF NOT EXISTS batches (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            genre TEXT NOT NULL,
-            status TEXT NOT NULL DEFAULT 'recording', -- 'recording', 'publishing', 'completed', 'stopped'
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-
-        CREATE TABLE IF NOT EXISTS songs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            batch_id INTEGER,
-            file_id TEXT NOT NULL,
-            file_unique_id TEXT NOT NULL,
-            artist TEXT,
-            title TEXT,
-            album TEXT,
-            duration INTEGER,
-            norm_key TEXT,
-            status TEXT NOT NULL DEFAULT 'queued', -- 'queued', 'duplicate_pending', 'skipped', 'published'
-            order_index INTEGER,
-            channel_message_id INTEGER,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY(batch_id) REFERENCES batches(id)
-        );
-
-        CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER PRIMARY KEY,
-            username TEXT,
-            first_name TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-
-        CREATE TABLE IF NOT EXISTS user_playlists (
-            user_id INTEGER NOT NULL,
-            song_id INTEGER NOT NULL,
-            added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            PRIMARY KEY (user_id, song_id),
-            FOREIGN KEY(song_id) REFERENCES songs(id)
-        );
-        """)
-    logger.info("✅ Database initialized successfully.")
-
-def register_user(user_id: int, username: str | None = None, first_name: str | None = None):
-    with get_db() as conn:
-        conn.execute(
-            "INSERT OR IGNORE INTO users (user_id, username, first_name) VALUES (?, ?, ?)",
-            (user_id, username, first_name)
-        )
-
-def is_user_registered(user_id: int) -> bool:
-    with get_db() as conn:
-        row = conn.execute("SELECT 1 FROM users WHERE user_id = ?", (user_id,)).fetchone()
-        return row is not None
+db: AsyncClient = None  # Supabase async client instance
 
 
 # ─────────────────────────────────────────────
@@ -150,7 +75,6 @@ def format_duration(seconds: int | None) -> str:
     return f"{mins}:{secs:02d}"
 
 def generate_caption(artist: str | None, album: str | None, genre: str) -> str:
-    """Generates only hashtags for the channel post as requested."""
     tags = [make_hashtag(genre), make_hashtag(artist)]
     if album:
         tags.append(make_hashtag(album))
@@ -170,25 +94,21 @@ async def get_bot_username(bot) -> str:
     return BOT_USERNAME
 
 async def is_user_subscribed(bot, user_id: int) -> bool:
-    """Checks if a user is an active member/admin of the music channel."""
     if user_id == ADMIN_ID:
         return True
     try:
         member = await bot.get_chat_member(chat_id=MUSIC_CHANNEL_ID, user_id=user_id)
         return member.status in ("creator", "administrator", "member", "restricted")
     except Exception as e:
-        logger.warning(f"Subscription verification error for user {user_id}: {e}")
+        logger.warning(f"Subscription check error for {user_id}: {e}")
         return False
 
 async def send_fsub_gate(message_or_query, pending_song_id: int | None = None, edit: bool = False):
-    """Sends the forced subscription gate with the channel join link."""
     retry_data = f"check_sub_{pending_song_id}" if pending_song_id else "check_sub"
-    
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("📢 Join Music Channel", url=CHANNEL_URL)],
-        [InlineKeyboardButton("🔄 I've Joined / Try Again", callback_data=retry_data, api_kwargs={"style": "primary"})]
+        [InlineKeyboardButton("🔄 I've Joined / Try Again", callback_data=retry_data)]
     ])
-    
     text = (
         "👋 <b>Welcome to the Music Hub!</b>\n\n"
         "To save songs, listen in high quality, and access your personal playlist, "
@@ -196,620 +116,257 @@ async def send_fsub_gate(message_or_query, pending_song_id: int | None = None, e
         f"1️⃣ Tap <b>Join Music Channel</b> (@{CHANNEL_USERNAME})\n"
         "2️⃣ Tap <b>I've Joined / Try Again</b> below"
     )
-
     if edit:
         await message_or_query.edit_message_text(text, reply_markup=keyboard, parse_mode="HTML")
     else:
         await message_or_query.reply_text(text, reply_markup=keyboard, parse_mode="HTML")
 
-
-# ─────────────────────────────────────────────
-# Zero-Local-State Backup Engine (Telegram Cloud Memory)
-# ─────────────────────────────────────────────
-def is_db_file(filename: str) -> bool:
-    """Identifies database files to prevent corruption via text editing."""
-    blocked = ('.db', '.db-wal', '.db-shm', '.sqlite', '.sqlite3')
-    base = os.path.basename(filename).lower()
-    return any(base.endswith(ext) for ext in blocked) or base.startswith("music_bot.db")
-
-def get_db_size() -> int:
-    return os.path.getsize(DB_PATH) if os.path.exists(DB_PATH) else 0
-
-async def auto_restore_on_boot(bot):
-    """
-    Checks if the host wiped the filesystem on restart.
-    If so, automatically pulls and restores the latest pinned DB backup from the group.
-    """
-    song_count = 0
+async def register_user(user_id: int, username: str | None = None, first_name: str | None = None):
     try:
-        with get_db() as conn:
-            song_count = conn.execute("SELECT COUNT(*) as c FROM songs").fetchone()["c"]
-    except Exception:
-        song_count = 0
-
-    if song_count == 0:
-        logger.warning("⚠️ Empty/Wiped database detected! Checking backup group for pinned snapshot...")
-        try:
-            chat = await bot.get_chat(BACKUP_GROUP_ID)
-            pinned = chat.pinned_message
-            if pinned and pinned.document and "music_bot.db" in (pinned.document.file_name or ""):
-                file_obj = await bot.get_file(pinned.document.file_id)
-                await file_obj.download_to_drive(DB_PATH)
-                logger.info("✅ Database AUTO-RESTORED from group pinned backup!")
-                init_db()
-            else:
-                logger.info("ℹ️ No previous pinned backup found in group to restore.")
-        except Exception as e:
-            logger.error(f"Failed to auto-restore backup: {e}")
-
-async def perform_group_backup(bot, force: bool = False) -> bool:
-    """
-    Flushes WAL into music_bot.db, deletes old pinned backup message,
-    uploads the clean DB, and pins it silently.
-    """
-    # 1. Force flush all WAL transactions into the main .db file
-    try:
-        with get_db() as conn:
-            conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+        await db.table("users").upsert({
+            "user_id": user_id,
+            "username": username,
+            "first_name": first_name
+        }).execute()
     except Exception as e:
-        logger.warning(f"wal_checkpoint notice: {e}")
+        logger.error(f"Error registering user {user_id}: {e}")
 
-    current_size = get_db_size()
-    if current_size == 0:
+async def is_user_registered(user_id: int) -> bool:
+    try:
+        res = await db.table("users").select("user_id").eq("user_id", user_id).limit(1).execute()
+        return len(res.data) > 0
+    except Exception:
         return False
 
-    # 2. Get the current pinned backup directly from Telegram (Zero local files needed)
-    try:
-        chat = await bot.get_chat(BACKUP_GROUP_ID)
-        pinned = chat.pinned_message
-    except Exception as e:
-        logger.warning(f"Could not fetch chat info: {e}")
-        pinned = None
 
-    # Check if size changed compared to pinned file
-    if not force and pinned and pinned.document:
-        if pinned.document.file_size == current_size:
-            logger.info("ℹ️ DB byte size unchanged. Skipping hourly backup.")
-            return False
+# ─────────────────────────────────────────────
+# Channel Sync Engine (Recovers 200+ Songs)
+# ─────────────────────────────────────────────
+async def scanchannel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Scans a range of channel message IDs by forwarding each to the admin,
+    extracting track metadata/file_id to Supabase, and deleting the forwarded post.
+    Usage: /scanchannel <start_id> <end_id>
+    """
+    if update.effective_user.id != ADMIN_ID:
+        return
 
-    # 3. Delete the old pinned backup message
-    if pinned:
-        try:
-            await bot.delete_message(chat_id=BACKUP_GROUP_ID, message_id=pinned.message_id)
-        except Exception as e:
-            logger.info(f"Old pinned backup could not be deleted: {e}")
-
-    # 4. Upload the clean, complete database
-    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    with open(DB_PATH, "rb") as f:
-        msg = await bot.send_document(
-            chat_id=BACKUP_GROUP_ID,
-            document=f,
-            filename="music_bot.db",
-            caption=f"📦 #DB_BACKUP\n<b>File:</b> <code>music_bot.db</code>\n<b>Size:</b> {format_file_size(current_size)}\n🕒 <i>{now_str}</i>",
+    args = context.args
+    if len(args) < 2:
+        await update.message.reply_text(
+            "⚠️ <b>Usage:</b> <code>/scanchannel &lt;start_id&gt; &lt;end_id&gt;</code>\n"
+            "<i>Example: /scanchannel 1 350</i>\n\n"
+            "💡 Tip: Copy the message link of your oldest and newest channel post to find the IDs.",
             parse_mode="HTML"
         )
+        return
 
-    # 5. Pin the new backup silently so it serves as cloud memory
     try:
-        await bot.pin_chat_message(
-            chat_id=BACKUP_GROUP_ID,
-            message_id=msg.message_id,
-            disable_notification=True
-        )
-    except Exception as e:
-        logger.warning(f"Could not pin backup message: {e}")
+        start_id = int(args[0])
+        end_id = int(args[1])
+    except ValueError:
+        await update.message.reply_text("⚠️ Start and end IDs must be valid numbers.", parse_mode="HTML")
+        return
 
-    logger.info(f"✅ Clean DB backup posted & pinned in group {BACKUP_GROUP_ID}.")
-    return True
+    if start_id > end_id:
+        start_id, end_id = end_id, start_id
 
-async def backup_scheduler_worker(bot):
-    """Checks DB byte size every 1 hour (3600 seconds) and updates group backups."""
-    await asyncio.sleep(60)
-    logger.info("🕒 Hourly DB backup scheduler started.")
-    while True:
-        try:
-            await perform_group_backup(bot)
-        except Exception as e:
-            logger.error(f"Error in backup_scheduler_worker: {e}")
-        await asyncio.sleep(3600)
-
-
-# ─────────────────────────────────────────────
-# Web Admin File Manager (Auth Protected)
-# ─────────────────────────────────────────────
-def check_web_auth(request: web.Request) -> bool:
-    """Validates HTTP Basic Auth credentials against ADMIN and PASS."""
-    auth_header = request.headers.get("Authorization")
-    if not auth_header or not auth_header.startswith("Basic "):
-        return False
-    try:
-        token = auth_header[6:].strip()
-        decoded = base64.b64decode(token).decode("utf-8")
-        username, password = decoded.split(":", 1)
-        return username == WEB_ADMIN_USER and password == WEB_ADMIN_PASS
-    except Exception:
-        return False
-
-def auth_required(handler):
-    async def middleware(request):
-        if not check_web_auth(request):
-            return web.Response(
-                status=401,
-                text="Unauthorized Access. Please supply valid ADMIN and PASS credentials.",
-                headers={"WWW-Authenticate": 'Basic realm="Bot Admin File Manager"'}
-            )
-        return await handler(request)
-    return middleware
-
-def safe_rel_path(rel_path: str = "") -> str | None:
-    """Prevents directory traversal outside project root."""
-    clean = rel_path.strip().lstrip("/\\")
-    full_path = os.path.abspath(os.path.join(BASE_DIR, clean))
-    if not full_path.startswith(BASE_DIR):
-        return None
-    return full_path
-
-def format_file_size(size: int) -> str:
-    if size < 1024:
-        return f"{size} B"
-    elif size < 1024 * 1024:
-        return f"{size / 1024:.1f} KB"
-    return f"{size / (1024 * 1024):.1f} MB"
-
-@auth_required
-async def admin_files_page(request: web.Request):
-    subpath = request.query.get("p", "").strip()
-    target_dir = safe_rel_path(subpath)
-
-    if not target_dir or not os.path.exists(target_dir):
-        return web.Response(text="Directory not found", status=404)
-
-    rel_current = os.path.relpath(target_dir, BASE_DIR)
-    if rel_current == ".":
-        rel_current = ""
-
-    items = []
-    try:
-        entries = sorted(os.listdir(target_dir))
-    except Exception as e:
-        return web.Response(text=f"Error reading directory: {e}", status=500)
-
-    for entry in entries:
-        full_item_path = os.path.join(target_dir, entry)
-        is_dir = os.path.isdir(full_item_path)
-        item_rel = os.path.relpath(full_item_path, BASE_DIR)
-        stat = os.stat(full_item_path)
-        mtime = datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M")
-        size_str = format_file_size(stat.st_size) if not is_dir else "DIR"
-        items.append({
-            "name": entry,
-            "is_dir": is_dir,
-            "rel": item_rel,
-            "size": size_str,
-            "mtime": mtime
-        })
-
-    parent_link = ""
-    if rel_current:
-        parent_rel = os.path.dirname(rel_current)
-        parent_link = f'<a href="/admin?p={parent_rel}" class="btn">⬅️ Back to Parent Directory</a>'
-
-    rows_html = ""
-    for item in items:
-        if item["is_dir"]:
-            icon = "📁"
-            name_cell = f'<a href="/admin?p={item["rel"]}" class="dir-link">{icon} <b>{html.escape(item["name"])}/</b></a>'
-            actions = "-"
-        else:
-            icon = "📄"
-            name_cell = f'{icon} {html.escape(item["name"])}'
-            actions = f'<a href="/admin/download?p={item["rel"]}" class="btn-sm btn-dl">⬇️ Download</a>'
-            
-            # Disable edit button for all .db / binary database files
-            if not is_db_file(item["name"]):
-                actions += f' <a href="/admin/edit?p={item["rel"]}" class="btn-sm btn-edit">✏️ Edit</a>'
-            else:
-                actions += ' <span style="color:#64748b;font-size:0.8em;">(DB protected)</span>'
-
-        rows_html += f"""
-        <tr>
-            <td>{name_cell}</td>
-            <td>{item['size']}</td>
-            <td>{item['mtime']}</td>
-            <td>{actions}</td>
-        </tr>
-        """
-
-    html_content = f"""<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Admin File Manager</title>
-    <style>
-        body {{ background:#0f172a; color:#e2e8f0; font-family:system-ui,sans-serif; margin:0; padding:20px; }}
-        .container {{ max-width:1050px; margin:0 auto; background:#1e293b; padding:24px; border-radius:14px; box-shadow:0 10px 30px rgba(0,0,0,0.5); }}
-        h1 {{ color:#38bdf8; margin-top:0; }}
-        .breadcrumb {{ background:#334155; padding:10px 14px; border-radius:8px; font-family:monospace; margin-bottom:16px; word-break:break-all; }}
-        table {{ width:100%; border-collapse:collapse; margin-top:16px; }}
-        th, td {{ padding:12px; text-align:left; border-bottom:1px solid #334155; }}
-        th {{ background:#0f172a; color:#94a3b8; font-size:0.9em; }}
-        a {{ color:#38bdf8; text-decoration:none; }}
-        a:hover {{ text-decoration:underline; }}
-        .btn {{ display:inline-block; padding:8px 14px; background:#38bdf8; color:#0f172a; font-weight:bold; border-radius:6px; text-decoration:none; margin-bottom:14px; }}
-        .btn-sm {{ display:inline-block; padding:4px 8px; border-radius:4px; font-size:0.8em; font-weight:600; text-decoration:none; margin-right:4px; }}
-        .btn-dl {{ background:#10b981; color:#fff; }}
-        .btn-edit {{ background:#6366f1; color:#fff; }}
-        .upload-box {{ background:#0f172a; padding:16px; border-radius:8px; margin-top:24px; border:1px dashed #475569; }}
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h1>🗂️ Admin File Manager</h1>
-        <div class="breadcrumb"><b>Path:</b> /{html.escape(rel_current)}</div>
-        {parent_link}
-        <table>
-            <thead>
-                <tr>
-                    <th>Name</th>
-                    <th>Size</th>
-                    <th>Last Modified</th>
-                    <th>Actions</th>
-                </tr>
-            </thead>
-            <tbody>
-                {rows_html}
-            </tbody>
-        </table>
-
-        <div class="upload-box">
-            <h3>📤 Upload File into this Directory</h3>
-            <form action="/admin/upload?p={rel_current}" method="post" enctype="multipart/form-data">
-                <input type="file" name="file" required style="color:#94a3b8;">
-                <button type="submit" class="btn" style="margin:0; cursor:pointer; padding:6px 14px;">Upload</button>
-            </form>
-        </div>
-    </div>
-</body>
-</html>"""
-    return web.Response(text=html_content, content_type="text/html")
-
-@auth_required
-async def admin_download_file(request: web.Request):
-    subpath = request.query.get("p", "").strip()
-    target_file = safe_rel_path(subpath)
-
-    if not target_file or not os.path.isfile(target_file):
-        return web.Response(text="File not found", status=404)
-
-    return web.FileResponse(
-        path=target_file,
-        headers={"Content-Disposition": f'attachment; filename="{os.path.basename(target_file)}"'}
+    progress_msg = await update.message.reply_text(
+        f"🔍 <b>Starting Channel Sync...</b>\n"
+        f"Scanning messages #{start_id} to #{end_id}\n"
+        f"<i>Please wait, this will populate Supabase without spamming the chat...</i>",
+        parse_mode="HTML"
     )
 
-@auth_required
-async def admin_edit_file_get(request: web.Request):
-    subpath = request.query.get("p", "").strip()
-    target_file = safe_rel_path(subpath)
+    imported = 0
+    skipped = 0
+    errors = 0
 
-    if not target_file or not os.path.isfile(target_file):
-        return web.Response(text="File not found", status=404)
+    for msg_id in range(start_id, end_id + 1):
+        try:
+            # Forward the message into admin DM to inspect audio metadata
+            fwd = await context.bot.forward_message(
+                chat_id=update.effective_chat.id,
+                from_chat_id=MUSIC_CHANNEL_ID,
+                message_id=msg_id
+            )
 
-    # Disallow text-editing of database files
-    if is_db_file(target_file):
-        return web.Response(
-            text="⚠️ Editing database (.db, .db-wal, .db-shm) files via text editor is disabled to prevent database corruption. Please download the file instead.",
-            status=403
-        )
+            # Check if it has an audio or music document
+            audio = fwd.audio
+            doc = fwd.document
+            file_id = None
+            file_unique_id = None
+            artist = "Unknown Artist"
+            title = "Unknown Track"
+            duration = 0
+            album = None
 
-    try:
-        with open(target_file, "r", encoding="utf-8", errors="replace") as f:
-            content = f.read()
-    except Exception as e:
-        return web.Response(text=f"Cannot read file: {e}", status=500)
+            if audio:
+                file_id = audio.file_id
+                file_unique_id = audio.file_unique_id
+                artist = audio.performer or "Unknown Artist"
+                title = audio.title or audio.file_name or "Track"
+                duration = audio.duration
+            elif doc and ((doc.mime_type and "audio" in doc.mime_type) or (doc.file_name and doc.file_name.lower().endswith(('.mp3', '.m4a', '.flac')))):
+                file_id = doc.file_id
+                file_unique_id = doc.file_unique_id
+                title = doc.file_name or "Track"
 
-    html_content = f"""<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <title>Editing: {html.escape(os.path.basename(target_file))}</title>
-    <style>
-        body {{ background:#0f172a; color:#e2e8f0; font-family:system-ui,sans-serif; margin:0; padding:20px; }}
-        .container {{ max-width:1050px; margin:0 auto; background:#1e293b; padding:24px; border-radius:12px; }}
-        textarea {{ width:100%; height:550px; background:#0f172a; color:#f8fafc; font-family:Consolas,monospace; font-size:14px; padding:12px; border:1px solid #334155; border-radius:8px; box-sizing:border-box; }}
-        .btn {{ padding:10px 18px; border-radius:6px; font-weight:bold; cursor:pointer; text-decoration:none; display:inline-block; border:none; }}
-        .btn-save {{ background:#10b981; color:#fff; margin-right:10px; }}
-        .btn-back {{ background:#475569; color:#fff; }}
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h2>✏️ Editing: <code>/{html.escape(subpath)}</code></h2>
-        <form method="post" action="/admin/edit?p={subpath}">
-            <textarea name="content">{html.escape(content)}</textarea>
-            <div style="margin-top:14px;">
-                <button type="submit" class="btn btn-save">💾 Save Changes</button>
-                <a href="/admin?p={os.path.dirname(subpath)}" class="btn btn-back">Cancel</a>
-            </div>
-        </form>
-    </div>
-</body>
-</html>"""
-    return web.Response(text=html_content, content_type="text/html")
+            # Always clean up the forwarded message
+            await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=fwd.message_id)
 
-@auth_required
-async def admin_edit_file_post(request: web.Request):
-    subpath = request.query.get("p", "").strip()
-    target_file = safe_rel_path(subpath)
+            if file_id and file_unique_id:
+                norm = normalize_key(artist, title)
 
-    if not target_file or not os.path.isfile(target_file):
-        return web.Response(text="File not found", status=404)
+                # Check if already present
+                dup_check = await db.table("songs").select("id").eq("file_unique_id", file_unique_id).limit(1).execute()
+                if not dup_check.data:
+                    await db.table("songs").insert({
+                        "file_id": file_id,
+                        "file_unique_id": file_unique_id,
+                        "artist": artist,
+                        "title": title,
+                        "album": album,
+                        "duration": duration,
+                        "norm_key": norm,
+                        "status": "published",
+                        "channel_message_id": msg_id
+                    }).execute()
+                    imported += 1
+                else:
+                    skipped += 1
+            else:
+                skipped += 1
 
-    if is_db_file(target_file):
-        return web.Response(text="Database editing prohibited.", status=403)
+        except BadRequest:
+            # Message was deleted or not found
+            errors += 1
+        except Exception as e:
+            logger.error(f"Error scanning message {msg_id}: {e}")
+            errors += 1
 
-    data = await request.post()
-    new_content = data.get("content", "")
-
-    try:
-        with open(target_file, "w", encoding="utf-8") as f:
-            f.write(new_content)
-    except Exception as e:
-        return web.Response(text=f"Failed to write file: {e}", status=500)
-
-    raise web.HTTPFound(location=f"/admin?p={os.path.dirname(subpath)}")
-
-@auth_required
-async def admin_upload_file(request: web.Request):
-    subpath = request.query.get("p", "").strip()
-    target_dir = safe_rel_path(subpath)
-
-    if not target_dir or not os.path.isdir(target_dir):
-        return web.Response(text="Directory not found", status=404)
-
-    reader = await request.multipart()
-    field = await reader.next()
-    if field and field.name == "file":
-        filename = os.path.basename(field.filename)
-        dest_path = os.path.join(target_dir, filename)
-        with open(dest_path, "wb") as f:
-            while True:
-                chunk = await field.read_chunk()
-                if not chunk:
-                    break
-                f.write(chunk)
-
-    raise web.HTTPFound(location=f"/admin?p={subpath}")
-
-
-# ─────────────────────────────────────────────
-# Dynamic Web Dashboard & Keep-Alive Pinger
-# ─────────────────────────────────────────────
-async def web_index(request):
-    with get_db() as conn:
-        active_batch = conn.execute("SELECT id, genre FROM batches WHERE status = 'recording'").fetchone()
-        total_songs = conn.execute("SELECT COUNT(*) as c FROM songs").fetchone()["c"]
-        published = conn.execute("SELECT COUNT(*) as c FROM songs WHERE status = 'published'").fetchone()["c"]
-        users_count = conn.execute("SELECT COUNT(*) as c FROM users").fetchone()["c"]
-
-    batch_str = f"Batch #{active_batch['id']} ({active_batch['genre']})" if active_batch else "None (Idle)"
-    broadcast_badge = "🟢 Broadcasting" if BROADCAST_ACTIVE else "⚪ Idle"
-
-    html_page = f"""<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width,initial-scale=1">
-    <title>Music Bot Status</title>
-    <style>
-        body {{ background:#0f172a; color:#e2e8f0; font-family:system-ui,sans-serif; display:flex; align-items:center; justify-content:center; height:100vh; margin:0; }}
-        .card {{ background:#1e293b; padding:40px; border-radius:16px; text-align:center; box-shadow:0 20px 40px rgba(0,0,0,.5); max-width:440px; border-top:4px solid #38bdf8; }}
-        h1 {{ color:#38bdf8; margin:0 0 10px; font-size:1.6rem; }}
-        .status {{ color:#4ade80; font-weight:700; margin:14px 0; display:inline-flex; align-items:center; gap:8px; font-size:1.05em; }}
-        .dot {{ width:10px; height:10px; background-color:#4ade80; border-radius:50%; box-shadow:0 0 8px #4ade80; }}
-        p {{ color:#94a3b8; line-height:1.6; margin-bottom:20px; font-size:0.95em; }}
-        .stats {{ display:grid; grid-template-columns:1fr 1fr; gap:10px; margin-bottom:20px; }}
-        .stat-box {{ background:#334155; padding:12px; border-radius:10px; text-align:center; }}
-        .stat-val {{ font-size:1.3em; font-weight:bold; color:#f8fafc; }}
-        .stat-lbl {{ font-size:0.8em; color:#94a3b8; }}
-        .tag {{ display:inline-block; background:#1e1b4b; color:#c7d2fe; padding:6px 14px; border-radius:20px; font-size:0.85em; font-weight:600; }}
-        .admin-link {{ display:block; margin-top:20px; color:#38bdf8; font-size:0.9em; text-decoration:none; }}
-    </style>
-</head>
-<body>
-    <div class="card">
-        <h1>🎧 Music Service Bot</h1>
-        <div class="status"><div class="dot"></div> Online & Polling Telegram</div>
-        <p>Automated music pipeline, channel broadcasting, and subscriber playlist engine.</p>
-        
-        <div class="stats">
-            <div class="stat-box">
-                <div class="stat-val">{total_songs}</div>
-                <div class="stat-lbl">Songs Tracked</div>
-            </div>
-            <div class="stat-box">
-                <div class="stat-val">{published}</div>
-                <div class="stat-lbl">Published Tracks</div>
-            </div>
-            <div class="stat-box" style="grid-column: span 2;">
-                <div class="stat-val">{users_count}</div>
-                <div class="stat-lbl">Active Bot Subscribers</div>
-            </div>
-        </div>
-
-        <div class="tag">Active Batch: {batch_str}</div>
-        <div class="tag" style="margin-top:8px;background:#334155;color:#f1f5f9;">Queue: {broadcast_badge}</div>
-        <a href="/admin" class="admin-link">🔒 Open File Manager & DB Browser</a>
-    </div>
-</body>
-</html>"""
-    return web.Response(text=html_page, content_type="text/html")
-
-async def keep_alive_pinger():
-    await asyncio.sleep(15)
-    target_url = APP_URL or f"http://127.0.0.1:{PORT}/"
-    logger.info(f"🔄 Keep-alive pinger started. Target: {target_url}")
-
-    async with aiohttp.ClientSession() as session:
-        while True:
+        # Periodic progress update every 25 messages
+        if (msg_id - start_id) % 25 == 0:
             try:
-                async with session.get(target_url, timeout=10) as resp:
-                    logger.info(f"💓 Keep-alive ping sent (HTTP {resp.status})")
-            except Exception as e:
-                logger.warning(f"⚠️ Keep-alive ping notice: {e}")
-            await asyncio.sleep(600)
+                await progress_msg.edit_text(
+                    f"🔍 <b>Scanning in Progress...</b>\n"
+                    f"• Processing: {msg_id}/{end_id}\n"
+                    f"• Tracks Indexed: {imported}\n"
+                    f"• Non-audio/Duplicates: {skipped}",
+                    parse_mode="HTML"
+                )
+            except Exception:
+                pass
+
+        await asyncio.sleep(0.35)  # Respect Telegram API limits
+
+    await progress_msg.edit_text(
+        f"✅ <b>Channel Sync Completed!</b>\n\n"
+        f"• <b>New Tracks Indexed:</b> {imported}\n"
+        f"• <b>Skipped / Duplicates:</b> {skipped}\n"
+        f"• <b>Non-existent IDs:</b> {errors}\n\n"
+        f"All indexed tracks are now available for subscribers in <code>/playlist</code>!",
+        parse_mode="HTML"
+    )
 
 
 # ─────────────────────────────────────────────
 # Admin Mode & Session Handlers
 # ─────────────────────────────────────────────
 async def adminmode_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Enables admin mode in private chat."""
     user = update.effective_user
     if user.id != ADMIN_ID:
         return
 
     if update.effective_chat.type != "private":
-        await update.message.reply_text("⚠️ Please send <code>/adminmode</code> in my private DM.", parse_mode="HTML")
+        await update.message.reply_text("⚠️ Send <code>/adminmode</code> in my private DM.", parse_mode="HTML")
         return
 
     ADMIN_MODE_USERS.add(user.id)
     await update.message.reply_text(
-        "🛠️ <b>Admin Mode: Activated</b>\n\n"
-        "You can now manage the bot directly from here:\n"
-        "• <code>/record &lt;genre&gt;</code> - Open a recording session (e.g. <code>/record rnb</code>)\n"
-        "• <b>Forward Songs Here</b> - Send/forward tracks directly to this chat!\n"
-        "• <code>/skipall</code> - Skip all pending duplicate tracks at once\n"
-        "• <code>/sync</code> - Reply to a DB document to restore it, or force backup update\n"
-        "• <code>/over</code> - Close session & begin automatic publishing\n"
-        "• <code>/stopbroadcast</code> - Pause or stop publishing\n"
-        "• <code>/pin</code> - Reply to any message to post & pin it to the channel with a 'Go listen' button\n"
-        "• <code>/status</code> - View current batch & stats\n"
+        "🛠️ <b>Admin Mode: Activated (Supabase Edition)</b>\n\n"
+        "• <code>/record &lt;genre&gt;</code> - Open recording session\n"
+        "• <b>Forward Songs Here</b> - Send tracks directly to DM or group\n"
+        "• <code>/skipall</code> - Skip all pending duplicate tracks\n"
+        "• <code>/scanchannel &lt;start&gt; &lt;end&gt;</code> - Recover/sync existing channel songs\n"
+        "• <code>/over</code> - Close session & start automatic publishing\n"
+        "• <code>/stopbroadcast</code> - Pause broadcast\n"
+        "• <code>/pin</code> - Reply to any message to post & pin it with 'Go listen'\n"
+        "• <code>/status</code> - View Supabase statistics\n"
         "• <code>/adminmodeoff</code> - Exit admin mode",
         parse_mode="HTML"
     )
 
 async def adminmodeoff_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Disables admin mode in private chat."""
-    user = update.effective_user
-    if user.id != ADMIN_ID:
+    if update.effective_user.id != ADMIN_ID:
         return
-
-    ADMIN_MODE_USERS.discard(user.id)
-    await update.message.reply_text("🔒 <b>Admin Mode: Deactivated</b>. Back to standard user mode.", parse_mode="HTML")
+    ADMIN_MODE_USERS.discard(update.effective_user.id)
+    await update.message.reply_text("🔒 <b>Admin Mode: Deactivated</b>.", parse_mode="HTML")
 
 async def record_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Starts a new recording batch for a specified genre."""
     if update.effective_user.id != ADMIN_ID:
         return
 
     args = context.args
     if not args:
-        await update.message.reply_text("⚠️ Please specify a genre. Example:\n<code>/record rnb</code>", parse_mode="HTML")
+        await update.message.reply_text("⚠️ Specify a genre. Example:\n<code>/record rnb</code>", parse_mode="HTML")
         return
 
     genre = " ".join(args).replace('"', '').strip()
 
-    with get_db() as conn:
-        active = conn.execute("SELECT id, genre FROM batches WHERE status = 'recording'").fetchone()
-        if active:
-            await update.message.reply_text(
-                f"⚠️ Batch #{active['id']} (<b>{active['genre']}</b>) is currently recording.\n"
-                f"Send <code>/over</code> to finish it first.",
-                parse_mode="HTML"
-            )
-            return
+    # Check for ongoing recording batch
+    active = await db.table("batches").select("id, genre").eq("status", "recording").limit(1).execute()
+    if active.data:
+        cur = active.data[0]
+        await update.message.reply_text(
+            f"⚠️ Batch #{cur['id']} (<b>{cur['genre']}</b>) is currently recording.\n"
+            f"Send <code>/over</code> to finish it first.",
+            parse_mode="HTML"
+        )
+        return
 
-        cur = conn.execute("INSERT INTO batches (genre, status) VALUES (?, 'recording')", (genre,))
-        batch_id = cur.lastrowid
+    res = await db.table("batches").insert({"genre": genre, "status": "recording"}).execute()
+    batch_id = res.data[0]["id"]
 
     await update.message.reply_text(
         f"🎙️ <b>Recording Session #{batch_id} Started!</b>\n"
         f"• <b>Genre:</b> #{make_hashtag(genre)[1:]}\n\n"
-        f"👉 <b>Forward songs directly here</b> (or into the group).\n"
-        f"👉 Send <code>/skipall</code> to skip duplicate tracks.\n"
+        f"👉 Forward songs directly here or in the group.\n"
+        f"👉 Send <code>/skipall</code> to discard duplicates.\n"
         f"👉 Send <code>/over</code> when finished to begin channel broadcast.",
         parse_mode="HTML"
     )
 
 async def skipall_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Admin command: Skips all songs that are in duplicate_pending status."""
     if update.effective_user.id != ADMIN_ID:
         return
 
-    with get_db() as conn:
-        cur = conn.execute("UPDATE songs SET status = 'skipped' WHERE status = 'duplicate_pending'")
-        skipped_count = cur.rowcount
-
-    await update.message.reply_text(
-        f"🚫 <b>Skipped {skipped_count} duplicate song(s).</b>",
-        parse_mode="HTML"
-    )
-
-async def sync_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Handles manual DB restoration from uploaded files, 
-    and initializes/forces the automated group backup engine.
-    """
-    if update.effective_user.id != ADMIN_ID:
-        return
-
-    replied = update.message.reply_to_message
-    if replied and replied.document:
-        doc = replied.document
-        fname = doc.file_name or "music_bot.db"
-        valid_files = ("music_bot.db", "music_bot.db-wal", "music_bot.db-shm")
-
-        if fname in valid_files:
-            file_obj = await context.bot.get_file(doc.file_id)
-            await file_obj.download_to_drive(custom_path=fname)
-            await update.message.reply_text(
-                f"📥 <b>Restored & Replaced:</b> <code>{fname}</code>\n"
-                f"• Size: {format_file_size(doc.file_size or 0)}",
-                parse_mode="HTML"
-            )
-            try:
-                init_db()
-            except Exception:
-                pass
-            return
-        else:
-            await update.message.reply_text(
-                f"⚠️ File name must be one of: <code>{', '.join(valid_files)}</code>.",
-                parse_mode="HTML"
-            )
-            return
-
-    # If run without reply: Force immediate clean backup push and pin it
-    await update.message.reply_text("🔄 <b>Syncing database and pushing fresh backup to group...</b>", parse_mode="HTML")
-    await perform_group_backup(context.bot, force=True)
-    await update.message.reply_text("✅ <b>Database synchronized!</b> Backup posted, pinned, and 1-hour monitor is active.", parse_mode="HTML")
+    res = await db.table("songs").update({"status": "skipped"}).eq("status", "duplicate_pending").execute()
+    count = len(res.data) if res.data else 0
+    await update.message.reply_text(f"🚫 <b>Skipped {count} duplicate song(s).</b>", parse_mode="HTML")
 
 async def over_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Closes the recording session and starts publishing to the channel."""
     global BROADCAST_ACTIVE
     if update.effective_user.id != ADMIN_ID:
         return
 
-    with get_db() as conn:
-        batch = conn.execute("SELECT id, genre FROM batches WHERE status = 'recording'").fetchone()
-        if not batch:
-            await update.message.reply_text("ℹ️ No active recording session found. Start one with <code>/record &lt;genre&gt;</code>.", parse_mode="HTML")
-            return
+    active = await db.table("batches").select("*").eq("status", "recording").limit(1).execute()
+    if not active.data:
+        await update.message.reply_text("ℹ️ No active recording session. Start with <code>/record &lt;genre&gt;</code>.", parse_mode="HTML")
+        return
 
-        batch_id = batch["id"]
-        genre = batch["genre"]
+    batch = active.data[0]
+    batch_id = batch["id"]
+    genre = batch["genre"]
 
-        queued_count = conn.execute("SELECT COUNT(*) as c FROM songs WHERE batch_id = ? AND status = 'queued'", (batch_id,)).fetchone()["c"]
-        pending_count = conn.execute("SELECT COUNT(*) as c FROM songs WHERE batch_id = ? AND status = 'duplicate_pending'", (batch_id,)).fetchone()["c"]
+    q_res = await db.table("songs").select("id", count="exact").eq("batch_id", batch_id).eq("status", "queued").execute()
+    queued_count = q_res.count or 0
 
-        conn.execute("UPDATE batches SET status = 'publishing' WHERE id = ?", (batch_id,))
+    await db.table("batches").update({"status": "publishing"}).eq("id", batch_id).execute()
 
     await update.message.reply_text(
         f"🏁 <b>Recording Session #{batch_id} Closed</b>\n"
-        f"• <b>Queued songs:</b> {queued_count}\n"
-        f"• <b>Pending duplicates:</b> {pending_count}\n\n"
+        f"• <b>Queued songs:</b> {queued_count}\n\n"
         f"🚀 <b>Starting automatic broadcast to channel...</b>\n"
         f"<i>(Send <code>/stopbroadcast</code> at any time to pause)</i>",
         parse_mode="HTML"
@@ -819,103 +376,77 @@ async def over_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     asyncio.create_task(broadcast_worker(context.application, batch_id, genre, notify_chat_id=update.effective_chat.id))
 
 async def stopbroadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Stops the active channel broadcast."""
     global BROADCAST_ACTIVE
     if update.effective_user.id != ADMIN_ID:
         return
 
     if not BROADCAST_ACTIVE:
-        await update.message.reply_text("ℹ️ There is no broadcast running right now.")
+        await update.message.reply_text("ℹ️ No broadcast running.")
         return
 
     BROADCAST_ACTIVE = False
-    await update.message.reply_text("🛑 <b>Broadcast stopping...</b> Remaining tracks remain queued.", parse_mode="HTML")
+    await update.message.reply_text("🛑 <b>Broadcast stopping...</b> Remaining tracks stay queued.", parse_mode="HTML")
 
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Displays current system and batch information."""
     if update.effective_user.id != ADMIN_ID:
         return
 
-    with get_db() as conn:
-        active_rec = conn.execute("SELECT * FROM batches WHERE status = 'recording'").fetchone()
-        total_songs = conn.execute("SELECT COUNT(*) as c FROM songs").fetchone()["c"]
-        published_songs = conn.execute("SELECT COUNT(*) as c FROM songs WHERE status = 'published'").fetchone()["c"]
-        total_users = conn.execute("SELECT COUNT(*) as c FROM users").fetchone()["c"]
+    total_songs = (await db.table("songs").select("id", count="exact").execute()).count or 0
+    published_songs = (await db.table("songs").select("id", count="exact").eq("status", "published").execute()).count or 0
+    total_users = (await db.table("users").select("user_id", count="exact").execute()).count or 0
+    active_rec = await db.table("batches").select("*").eq("status", "recording").limit(1).execute()
 
     is_adm_mode = "🟢 Active" if update.effective_user.id in ADMIN_MODE_USERS else "⚪ Inactive"
 
     status_msg = (
-        f"⚙️ <b>Bot System Status</b>\n\n"
-        f"• <b>Admin Mode in DM:</b> {is_adm_mode}\n"
+        f"⚙️ <b>Bot System Status (Supabase)</b>\n\n"
+        f"• <b>Admin Mode:</b> {is_adm_mode}\n"
         f"• <b>Active Broadcast:</b> {'🟢 Running' if BROADCAST_ACTIVE else '⚪ Idle'}\n"
-        f"• <b>Recording/Backup Group:</b> <code>{BACKUP_GROUP_ID}</code>\n"
         f"• <b>Music Channel:</b> <code>{MUSIC_CHANNEL_ID}</code> (@{CHANNEL_USERNAME})\n"
         f"• <b>Total Songs in DB:</b> {total_songs}\n"
-        f"• <b>Total Published:</b> {published_songs}\n"
+        f"• <b>Published Songs:</b> {published_songs}\n"
         f"• <b>Registered Users:</b> {total_users}\n\n"
     )
 
-    if active_rec:
-        status_msg += f"🎙️ <b>Active Batch:</b> #{active_rec['id']} (Genre: {active_rec['genre']})"
+    if active_rec.data:
+        status_msg += f"🎙️ <b>Active Batch:</b> #{active_rec.data[0]['id']} (Genre: {active_rec.data[0]['genre']})"
     else:
         status_msg += "🎙️ <b>Active Batch:</b> None (Use /record <genre>)"
 
     await update.message.reply_text(status_msg, parse_mode="HTML")
 
 async def pin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Admin command: copies the replied message to the channel with a 'Go listen' button and pins it."""
     if update.effective_user.id != ADMIN_ID:
         return
 
-    replied_msg = update.message.reply_to_message
-    if not replied_msg:
-        await update.message.reply_text(
-            "⚠️ <b>Usage:</b> Reply to any message you want to post and pin in the channel with <code>/pin</code>.",
-            parse_mode="HTML"
-        )
+    replied = update.message.reply_to_message
+    if not replied:
+        await update.message.reply_text("⚠️ Reply to the message you want to post & pin in the channel with <code>/pin</code>.", parse_mode="HTML")
         return
 
     bot_user = await get_bot_username(context.bot)
     listen_markup = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton(
-                text="🎧 Go listen",
-                url=f"https://t.me/{bot_user}",
-                api_kwargs={"style": "primary"}
-            )
-        ]
+        [InlineKeyboardButton("🎧 Go listen", url=f"https://t.me/{bot_user}")]
     ])
 
     try:
-        sent_channel_msg = await context.bot.copy_message(
+        sent_msg = await context.bot.copy_message(
             chat_id=MUSIC_CHANNEL_ID,
             from_chat_id=update.effective_chat.id,
-            message_id=replied_msg.message_id,
+            message_id=replied.message_id,
             reply_markup=listen_markup
         )
-
-        await context.bot.pin_chat_message(
-            chat_id=MUSIC_CHANNEL_ID,
-            message_id=sent_channel_msg.message_id
-        )
-
-        await update.message.reply_text(
-            "✅ <b>Message successfully posted and pinned in the channel!</b>",
-            parse_mode="HTML"
-        )
-    except BadRequest as e:
-        logger.error(f"Failed to post/pin message: {e}")
-        await update.message.reply_text(f"❌ <b>Telegram API Error:</b> {e.message}", parse_mode="HTML")
+        await context.bot.pin_chat_message(chat_id=MUSIC_CHANNEL_ID, message_id=sent_msg.message_id)
+        await update.message.reply_text("✅ Message successfully posted and pinned in channel!", parse_mode="HTML")
     except Exception as e:
-        logger.error(f"Unexpected error in /pin: {e}")
-        await update.message.reply_text(f"❌ <b>Error:</b> {e}", parse_mode="HTML")
+        logger.error(f"Error in /pin: {e}")
+        await update.message.reply_text(f"❌ Error: {e}", parse_mode="HTML")
 
 
 # ─────────────────────────────────────────────
-# Audio Ingestion (Group + DM Support)
+# Audio Ingestion
 # ─────────────────────────────────────────────
 async def handle_audio_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Ingests audio sent either in the recording group OR directly in DM during admin mode."""
     msg = update.message
     if not msg:
         return
@@ -928,7 +459,6 @@ async def handle_audio_message(update: Update, context: ContextTypes.DEFAULT_TYP
 
     audio = msg.audio
     doc = msg.document
-    
     file_id = None
     file_unique_id = None
     duration = 0
@@ -949,55 +479,64 @@ async def handle_audio_message(update: Update, context: ContextTypes.DEFAULT_TYP
     else:
         return
 
-    with get_db() as conn:
-        batch = conn.execute("SELECT id FROM batches WHERE status = 'recording'").fetchone()
-        if not batch:
-            if is_dm_admin:
-                await msg.reply_text("⚠️ No active recording session! Send <code>/record &lt;genre&gt;</code> first.", parse_mode="HTML")
-            return
+    active = await db.table("batches").select("id").eq("status", "recording").limit(1).execute()
+    if not active.data:
+        if is_dm_admin:
+            await msg.reply_text("⚠️ No active recording session! Send <code>/record &lt;genre&gt;</code> first.", parse_mode="HTML")
+        return
 
-        batch_id = batch["id"]
-        norm = normalize_key(artist, title)
+    batch_id = active.data[0]["id"]
+    norm = normalize_key(artist, title)
 
-        existing = conn.execute(
-            "SELECT id, artist, title FROM songs WHERE norm_key = ? AND status != 'skipped'",
-            (norm,)
-        ).fetchone()
+    # Check for duplicates by normalized key or file unique ID
+    existing = await db.table("songs").select("id, artist, title").or_(f"norm_key.eq.{norm},file_unique_id.eq.{file_unique_id}").neq("status", "skipped").limit(1).execute()
 
-        order_row = conn.execute(
-            "SELECT MAX(order_index) as max_order FROM songs WHERE batch_id = ?",
-            (batch_id,)
-        ).fetchone()
-        next_order = (order_row["max_order"] or 0) + 1
+    # Get max order_index
+    order_res = await db.table("songs").select("order_index").eq("batch_id", batch_id).order("order_index", desc=True).limit(1).execute()
+    next_order = (order_res.data[0]["order_index"] + 1) if order_res.data and order_res.data[0]["order_index"] else 1
 
-        if existing:
-            cur = conn.execute(
-                """INSERT INTO songs (batch_id, file_id, file_unique_id, artist, title, album, duration, norm_key, status, order_index)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'duplicate_pending', ?)""",
-                (batch_id, file_id, file_unique_id, artist, title, album, duration, norm, next_order)
-            )
-            song_id = cur.lastrowid
+    if existing.data:
+        res = await db.table("songs").insert({
+            "batch_id": batch_id,
+            "file_id": file_id,
+            "file_unique_id": file_unique_id,
+            "artist": artist,
+            "title": title,
+            "album": album,
+            "duration": duration,
+            "norm_key": norm,
+            "status": "duplicate_pending",
+            "order_index": next_order
+        }).execute()
+        song_id = res.data[0]["id"]
 
-            buttons = [
-                [
-                    InlineKeyboardButton("🚫 Skip", callback_data=f"dup_skip_{song_id}", api_kwargs={"style": "danger"}),
-                    InlineKeyboardButton("⚠️ Record Anyway", callback_data=f"dup_keep_{song_id}", api_kwargs={"style": "primary"}),
-                ]
+        buttons = [
+            [
+                InlineKeyboardButton("🚫 Skip", callback_data=f"dup_skip_{song_id}"),
+                InlineKeyboardButton("⚠️ Record Anyway", callback_data=f"dup_keep_{song_id}"),
             ]
-            await msg.reply_text(
-                f"⚠️ <b>Duplicate Detected</b>\n"
-                f"🎵 <b>{artist} - {title}</b> already exists in DB.\n"
-                f"Action for track #{next_order} (or send <code>/skipall</code>):",
-                reply_markup=InlineKeyboardMarkup(buttons),
-                parse_mode="HTML"
-            )
-        else:
-            conn.execute(
-                """INSERT INTO songs (batch_id, file_id, file_unique_id, artist, title, album, duration, norm_key, status, order_index)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?)""",
-                (batch_id, file_id, file_unique_id, artist, title, album, duration, norm, next_order)
-            )
-            logger.info(f"✅ Queued track #{next_order}: {artist} - {title}")
+        ]
+        await msg.reply_text(
+            f"⚠️ <b>Duplicate Detected</b>\n"
+            f"🎵 <b>{artist} - {title}</b> already exists in DB.\n"
+            f"Action for track #{next_order} (or send <code>/skipall</code>):",
+            reply_markup=InlineKeyboardMarkup(buttons),
+            parse_mode="HTML"
+        )
+    else:
+        await db.table("songs").insert({
+            "batch_id": batch_id,
+            "file_id": file_id,
+            "file_unique_id": file_unique_id,
+            "artist": artist,
+            "title": title,
+            "album": album,
+            "duration": duration,
+            "norm_key": norm,
+            "status": "queued",
+            "order_index": next_order
+        }).execute()
+        logger.info(f"✅ Queued track #{next_order}: {artist} - {title}")
 
 async def duplicate_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -1005,23 +544,21 @@ async def duplicate_callback_handler(update: Update, context: ContextTypes.DEFAU
         await query.answer("Admin only.", show_alert=True)
         return
 
-    data = query.data
-    action, song_id_str = data.rsplit("_", 1)
+    action, song_id_str = query.data.rsplit("_", 1)
     song_id = int(song_id_str)
 
-    with get_db() as conn:
-        if action == "dup_skip":
-            conn.execute("UPDATE songs SET status = 'skipped' WHERE id = ?", (song_id,))
-            await query.answer("Track skipped.")
-            await query.edit_message_text("🚫 <b>Track Skipped.</b>", parse_mode="HTML")
-        elif action == "dup_keep":
-            conn.execute("UPDATE songs SET status = 'queued' WHERE id = ?", (song_id,))
-            await query.answer("Track queued for publishing.")
-            await query.edit_message_text("✅ <b>Track Kept and Queued.</b>", parse_mode="HTML")
+    if action == "dup_skip":
+        await db.table("songs").update({"status": "skipped"}).eq("id", song_id).execute()
+        await query.answer("Track skipped.")
+        await query.edit_message_text("🚫 <b>Track Skipped.</b>", parse_mode="HTML")
+    elif action == "dup_keep":
+        await db.table("songs").update({"status": "queued"}).eq("id", song_id).execute()
+        await query.answer("Track queued.")
+        await query.edit_message_text("✅ <b>Track Kept and Queued.</b>", parse_mode="HTML")
 
 
 # ─────────────────────────────────────────────
-# Automated Channel Publishing Queue
+# Channel Publishing Queue
 # ─────────────────────────────────────────────
 async def broadcast_worker(app: Application, batch_id: int, genre: str, notify_chat_id: int):
     global BROADCAST_ACTIVE
@@ -1029,34 +566,16 @@ async def broadcast_worker(app: Application, batch_id: int, genre: str, notify_c
     published_count = 0
 
     while BROADCAST_ACTIVE:
-        with get_db() as conn:
-            song = conn.execute(
-                """SELECT * FROM songs 
-                   WHERE batch_id = ? AND status = 'queued' 
-                   ORDER BY order_index ASC LIMIT 1""",
-                (batch_id,)
-            ).fetchone()
-
-        if not song:
-            logger.info(f"Batch #{batch_id} completed.")
+        res = await db.table("songs").select("*").eq("batch_id", batch_id).eq("status", "queued").order("order_index").limit(1).execute()
+        if not res.data:
             break
 
+        song = res.data[0]
         song_id = song["id"]
-        # Generated caption contains ONLY the hashtags
-        caption = generate_caption(
-            artist=song["artist"],
-            album=song["album"],
-            genre=genre
-        )
+        caption = generate_caption(artist=song["artist"], album=song["album"], genre=genre)
 
         channel_markup = InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton(
-                    text="➕ Add to Playlist",
-                    callback_data=f"pl_add_{song_id}",
-                    api_kwargs={"style": "success"}
-                )
-            ]
+            [InlineKeyboardButton("➕ Add to Playlist", callback_data=f"pl_add_{song_id}")]
         ])
 
         try:
@@ -1071,11 +590,11 @@ async def broadcast_worker(app: Application, batch_id: int, genre: str, notify_c
                 reply_markup=channel_markup
             )
 
-            with get_db() as conn:
-                conn.execute(
-                    "UPDATE songs SET status = 'published', channel_message_id = ? WHERE id = ?",
-                    (sent_msg.message_id, song_id)
-                )
+            await db.table("songs").update({
+                "status": "published",
+                "channel_message_id": sent_msg.message_id
+            }).eq("id", song_id).execute()
+
             published_count += 1
             await asyncio.sleep(2.5)
 
@@ -1083,56 +602,43 @@ async def broadcast_worker(app: Application, batch_id: int, genre: str, notify_c
             logger.error(f"Error publishing song #{song_id}: {e}")
             await asyncio.sleep(5)
 
-    with get_db() as conn:
-        status_to_set = "completed" if not conn.execute("SELECT 1 FROM songs WHERE batch_id = ? AND status = 'queued'", (batch_id,)).fetchone() else "stopped"
-        conn.execute("UPDATE batches SET status = ? WHERE id = ?", (status_to_set, batch_id))
+    remaining = await db.table("songs").select("id").eq("batch_id", batch_id).eq("status", "queued").limit(1).execute()
+    final_status = "stopped" if remaining.data else "completed"
+    await db.table("batches").update({"status": final_status}).eq("id", batch_id).execute()
 
     BROADCAST_ACTIVE = False
-    
     await app.bot.send_message(
         chat_id=notify_chat_id,
         text=f"🏁 <b>Broadcast finished for Batch #{batch_id}!</b>\n"
              f"• <b>Published:</b> {published_count} tracks\n"
-             f"• <b>Status:</b> <i>{status_to_set}</i>",
+             f"• <b>Status:</b> <i>{final_status}</i>",
         parse_mode="HTML"
     )
 
 
 # ─────────────────────────────────────────────
-# Subscriber Playlist & Membership Gate Handlers
+# Subscriber Playlist Handlers
 # ─────────────────────────────────────────────
 async def add_to_playlist_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handles 'Add to Playlist' button clicks in the channel."""
     query = update.callback_query
     user = query.from_user
-    user_id = user.id
     song_id = int(query.data.replace("pl_add_", ""))
     bot_user = await get_bot_username(context.bot)
 
-    if not is_user_registered(user_id):
-        redirect_url = f"https://t.me/{bot_user}?start=save_{song_id}"
-        await query.answer(url=redirect_url)
+    if not await is_user_registered(user.id):
+        await query.answer(url=f"https://t.me/{bot_user}?start=save_{song_id}")
         return
 
-    with get_db() as conn:
-        already_saved = conn.execute(
-            "SELECT 1 FROM user_playlists WHERE user_id = ? AND song_id = ?",
-            (user_id, song_id)
-        ).fetchone()
+    # Check if already added
+    check = await db.table("user_playlists").select("song_id").eq("user_id", user.id).eq("song_id", song_id).limit(1).execute()
+    if check.data:
+        await query.answer("Already in your playlist! 🎧", show_alert=False)
+        return
 
-        if already_saved:
-            await query.answer("Already in your playlist! 🎧", show_alert=False)
-            return
-
-        conn.execute(
-            "INSERT INTO user_playlists (user_id, song_id) VALUES (?, ?)",
-            (user_id, song_id)
-        )
-
-    await query.answer("Added to your playlist! ⭐ Check your private chat with the bot.", show_alert=False)
+    await db.table("user_playlists").insert({"user_id": user.id, "song_id": song_id}).execute()
+    await query.answer("Added to your playlist! ⭐ Check bot DM.", show_alert=False)
 
 async def check_sub_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handles the 'Try Again' button when a user verifies their channel membership."""
     query = update.callback_query
     user = query.from_user
     data = query.data
@@ -1144,105 +650,87 @@ async def check_sub_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         except ValueError:
             pending_song_id = None
 
-    is_sub = await is_user_subscribed(context.bot, user.id)
-    if not is_sub:
-        await query.answer("⚠️ You haven't joined the channel yet! Please join first.", show_alert=True)
+    if not await is_user_subscribed(context.bot, user.id):
+        await query.answer("⚠️ You haven't joined the channel yet!", show_alert=True)
         return
 
-    register_user(user.id, user.username, user.first_name)
+    await register_user(user.id, user.username, user.first_name)
     await query.answer("✅ Channel membership verified!")
 
     if pending_song_id:
-        with get_db() as conn:
-            conn.execute(
-                "INSERT OR IGNORE INTO user_playlists (user_id, song_id) VALUES (?, ?)",
-                (user.id, pending_song_id)
-            )
-            song = conn.execute("SELECT artist, title FROM songs WHERE id = ?", (pending_song_id,)).fetchone()
-
-        song_info = f"<b>{song['artist']} - {song['title']}</b>" if song else "the selected track"
+        await db.table("user_playlists").upsert({"user_id": user.id, "song_id": pending_song_id}).execute()
+        song_data = await db.table("songs").select("artist, title").eq("id", pending_song_id).limit(1).execute()
+        info = f"<b>{song_data.data[0]['artist']} - {song_data.data[0]['title']}</b>" if song_data.data else "the track"
         await query.edit_message_text(
-            f"🎉 <b>Welcome!</b>\n\n"
-            f"✅ We saved {song_info} to your personal playlist!\n\n"
-            f"Send <code>/playlist</code> anytime to view and stream your tracks.",
+            f"🎉 <b>Welcome!</b>\n\n✅ Saved {info} to your playlist!\nSend <code>/playlist</code> to stream.",
             parse_mode="HTML"
         )
     else:
         await query.edit_message_text(
-            "👋 <b>Welcome to the Music Hub!</b>\n\n"
-            "• Tap <b>Add to Playlist</b> under any track in our channel to save it.\n"
-            "• Send <code>/playlist</code> here to view and play your saved songs.",
+            "👋 <b>Welcome to the Music Hub!</b>\n\n• Tap <b>Add to Playlist</b> under channel songs.\n• Send <code>/playlist</code> to stream.",
             parse_mode="HTML"
         )
 
 async def user_playlist_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Displays saved songs in user's private chat after verifying subscription."""
     if update.effective_chat.type != "private":
         await update.message.reply_text("Please check your playlist in my private chat! 🎧")
         return
 
     user = update.effective_user
-    register_user(user.id, user.username, user.first_name)
+    await register_user(user.id, user.username, user.first_name)
 
     if not await is_user_subscribed(context.bot, user.id):
         await send_fsub_gate(update.message)
         return
 
-    page = 1
-    await render_playlist_page(update.message, user.id, page)
+    await render_playlist_page(update.message, user.id, page=1)
 
 async def render_playlist_page(message, user_id: int, page: int, edit=False):
     limit = 5
     offset = (page - 1) * limit
 
-    with get_db() as conn:
-        total = conn.execute(
-            "SELECT COUNT(*) as c FROM user_playlists WHERE user_id = ?",
-            (user_id,)
-        ).fetchone()["c"]
-
-        rows = conn.execute(
-            """SELECT s.id, s.artist, s.title, s.duration 
-               FROM user_playlists up
-               JOIN songs s ON up.song_id = s.id
-               WHERE up.user_id = ?
-               ORDER BY up.added_at DESC
-               LIMIT ? OFFSET ?""",
-            (user_id, limit, offset)
-        ).fetchall()
+    # Count total
+    count_res = await db.table("user_playlists").select("song_id", count="exact").eq("user_id", user_id).execute()
+    total = count_res.count or 0
 
     if total == 0:
-        text = "🎧 <b>Your playlist is empty!</b>\n\nTap the green <b>Add to Playlist</b> button under any song in our channel to save it here."
+        text = "🎧 <b>Your playlist is empty!</b>\n\nTap <b>Add to Playlist</b> under any song in our channel to save it."
         if edit:
             await message.edit_text(text, reply_markup=None, parse_mode="HTML")
         else:
             await message.reply_text(text, reply_markup=None, parse_mode="HTML")
         return
 
+    # Fetch tracks with joined metadata
+    res = await db.table("user_playlists").select(
+        "song_id, songs(id, artist, title, duration)"
+    ).eq("user_id", user_id).order("added_at", desc=True).range(offset, offset + limit - 1).execute()
+
     total_pages = (total + limit - 1) // limit
     text = f"🎧 <b>Your Saved Playlist</b> (Page {page}/{total_pages})\n\n"
-
     keyboard = []
-    for row in rows:
-        artist = row["artist"] or "Unknown"
-        title = row["title"] or "Track"
-        text += f"• 🎵 <b>{artist}</b> - {title} <i>({format_duration(row['duration'])})</i>\n"
-        # Option to Play and Remove from playlist
+
+    for item in res.data:
+        s = item["songs"]
+        if not s:
+            continue
+        artist = s["artist"] or "Unknown"
+        title = s["title"] or "Track"
+        text += f"• 🎵 <b>{artist}</b> - {title} <i>({format_duration(s['duration'])})</i>\n"
         keyboard.append([
-            InlineKeyboardButton(f"▶️ Play {title[:16]}", callback_data=f"pl_play_{row['id']}"),
-            InlineKeyboardButton("❌ Remove", callback_data=f"pl_rem_{row['id']}_{page}")
+            InlineKeyboardButton(f"▶️ Play {title[:16]}", callback_data=f"pl_play_{s['id']}"),
+            InlineKeyboardButton("❌ Remove", callback_data=f"pl_rem_{s['id']}_{page}")
         ])
 
-    nav_buttons = []
+    nav = []
     if page > 1:
-        nav_buttons.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"pl_page_{page-1}"))
+        nav.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"pl_page_{page-1}"))
     if page < total_pages:
-        nav_buttons.append(InlineKeyboardButton("Next ➡️", callback_data=f"pl_page_{page+1}"))
-    if nav_buttons:
-        keyboard.append(nav_buttons)
+        nav.append(InlineKeyboardButton("Next ➡️", callback_data=f"pl_page_{page+1}"))
+    if nav:
+        keyboard.append(nav)
 
     reply_markup = InlineKeyboardMarkup(keyboard)
-
     if edit:
         await message.edit_text(text, reply_markup=reply_markup, parse_mode="HTML")
     else:
@@ -1260,10 +748,9 @@ async def playlist_page_callback(update: Update, context: ContextTypes.DEFAULT_T
 
     elif data.startswith("pl_play_"):
         song_id = int(data.replace("pl_play_", ""))
-        with get_db() as conn:
-            song = conn.execute("SELECT file_id, artist, title FROM songs WHERE id = ?", (song_id,)).fetchone()
-
-        if song:
+        res = await db.table("songs").select("file_id, artist, title").eq("id", song_id).limit(1).execute()
+        if res.data:
+            song = res.data[0]
             await query.answer("Delivering audio...")
             await context.bot.send_audio(
                 chat_id=user_id,
@@ -1275,29 +762,19 @@ async def playlist_page_callback(update: Update, context: ContextTypes.DEFAULT_T
             await query.answer("Audio not found.", show_alert=True)
 
     elif data.startswith("pl_rem_"):
-        # Remove track from user's personal playlist
         parts = data.split("_")
         song_id = int(parts[2])
         page = int(parts[3])
 
-        with get_db() as conn:
-            conn.execute(
-                "DELETE FROM user_playlists WHERE user_id = ? AND song_id = ?",
-                (user_id, song_id)
-            )
-            total = conn.execute(
-                "SELECT COUNT(*) as c FROM user_playlists WHERE user_id = ?",
-                (user_id,)
-            ).fetchone()["c"]
+        await db.table("user_playlists").delete().eq("user_id", user_id).eq("song_id", song_id).execute()
+        await query.answer("Removed from playlist 🗑️")
 
-        await query.answer("Track removed from your playlist 🗑️")
+        total = (await db.table("user_playlists").select("song_id", count="exact").eq("user_id", user_id).execute()).count or 0
         limit = 5
         max_page = max(1, (total + limit - 1) // limit)
-        target_page = min(page, max_page)
-        await render_playlist_page(query.message, user_id, target_page, edit=True)
+        await render_playlist_page(query.message, user_id, min(page, max_page), edit=True)
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handles /start, deep-link playlist additions, and enforces channel subscription."""
     user = update.effective_user
     args = context.args
 
@@ -1309,119 +786,114 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pending_song_id = None
 
     if user.id == ADMIN_ID:
-        register_user(user.id, user.username, user.first_name)
+        await register_user(user.id, user.username, user.first_name)
         await update.message.reply_text(
             "👋 <b>Welcome Admin!</b>\n\n"
-            "Send <code>/adminmode</code> to manage music recording & broadcasts,\n"
-            "<code>/skipall</code> to skip all duplicate songs,\n"
-            "<code>/sync</code> to restore or push database backups,\n"
-            "<code>/pin</code> (in reply to a message) to post & pin to the channel,\n"
-            "or <code>/playlist</code> to view your saved music.",
+            "• <code>/adminmode</code> - Open admin control panel\n"
+            "• <code>/scanchannel &lt;start&gt; &lt;end&gt;</code> - Sync 200+ channel songs into Supabase\n"
+            "• <code>/playlist</code> - View personal playlist",
             parse_mode="HTML"
         )
         return
 
-    subscribed = await is_user_subscribed(context.bot, user.id)
-    if not subscribed:
+    if not await is_user_subscribed(context.bot, user.id):
         await send_fsub_gate(update.message, pending_song_id=pending_song_id)
         return
 
-    register_user(user.id, user.username, user.first_name)
+    await register_user(user.id, user.username, user.first_name)
 
     if pending_song_id:
-        with get_db() as conn:
-            conn.execute(
-                "INSERT OR IGNORE INTO user_playlists (user_id, song_id) VALUES (?, ?)",
-                (user.id, pending_song_id)
-            )
-            song = conn.execute("SELECT artist, title FROM songs WHERE id = ?", (pending_song_id,)).fetchone()
-
-        song_info = f"<b>{song['artist']} - {song['title']}</b>" if song else "the selected track"
+        await db.table("user_playlists").upsert({"user_id": user.id, "song_id": pending_song_id}).execute()
+        song = await db.table("songs").select("artist, title").eq("id", pending_song_id).limit(1).execute()
+        info = f"<b>{song.data[0]['artist']} - {song.data[0]['title']}</b>" if song.data else "the song"
         await update.message.reply_text(
-            f"🎉 <b>Welcome to the Music Hub!</b>\n\n"
-            f"✅ We added {song_info} to your personal playlist.\n"
-            f"Send <code>/playlist</code> here anytime to view and play your songs.",
+            f"🎉 <b>Welcome!</b>\n\n✅ Added {info} to your playlist.\nSend <code>/playlist</code> to stream.",
             parse_mode="HTML"
         )
     else:
         await update.message.reply_text(
-            "👋 <b>Welcome to the Music Hub!</b>\n\n"
-            "• Tap <b>Add to Playlist</b> under any track in our channel to save it.\n"
-            "• Send <code>/playlist</code> here to view and play your saved songs.",
+            "👋 <b>Welcome to the Music Hub!</b>\n\n• Tap <b>Add to Playlist</b> under channel songs.\n• Send <code>/playlist</code> to stream.",
             parse_mode="HTML"
         )
+
+
+# ─────────────────────────────────────────────
+# Web Health Check & Keep-Alive
+# ─────────────────────────────────────────────
+async def web_index(request):
+    return web.Response(
+        text="<h1>Music Bot Online</h1><p>Running with persistent Supabase backend.</p>",
+        content_type="text/html"
+    )
+
+async def keep_alive_pinger():
+    await asyncio.sleep(15)
+    target_url = APP_URL or f"http://127.0.0.1:{PORT}/"
+    async with aiohttp.ClientSession() as session:
+        while True:
+            try:
+                async with session.get(target_url, timeout=10) as resp:
+                    logger.info(f"💓 Keep-alive ping sent (HTTP {resp.status})")
+            except Exception as e:
+                logger.warning(f"Keep-alive ping notice: {e}")
+            await asyncio.sleep(600)
 
 
 # ─────────────────────────────────────────────
 # Main Application Runtime
 # ─────────────────────────────────────────────
 async def main():
+    global db
     if not BOT_TOKEN:
-        logger.error("TELEGRAM_TOKEN is missing! Set it in your environment variables.")
+        logger.error("TELEGRAM_TOKEN is missing!")
+        return
+    if not SUPABASE_KEY:
+        logger.error("SUPABASE_KEY is missing! Please set your service_role key.")
         return
 
-    init_db()
+    # Initialize Supabase client
+    db = await create_async_client(SUPABASE_URL, SUPABASE_KEY)
+    logger.info("✅ Connected to Supabase Cloud Database!")
 
     app = Application.builder().token(BOT_TOKEN).build()
 
-    # Admin Mode Handlers
+    # Handlers
+    app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("adminmode", adminmode_command))
     app.add_handler(CommandHandler("adminmodeoff", adminmodeoff_command))
     app.add_handler(CommandHandler("record", record_command))
     app.add_handler(CommandHandler("skipall", skipall_command))
-    app.add_handler(CommandHandler("sync", sync_command))
+    app.add_handler(CommandHandler("scanchannel", scanchannel_command))
     app.add_handler(CommandHandler("over", over_command))
     app.add_handler(CommandHandler("stopbroadcast", stopbroadcast_command))
     app.add_handler(CommandHandler("status", status_command))
     app.add_handler(CommandHandler("pin", pin_command))
-
-    # User Handlers
-    app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("playlist", user_playlist_command))
 
-    # Callbacks
     app.add_handler(CallbackQueryHandler(duplicate_callback_handler, pattern=r"^dup_"))
     app.add_handler(CallbackQueryHandler(add_to_playlist_callback, pattern=r"^pl_add_"))
     app.add_handler(CallbackQueryHandler(check_sub_callback, pattern=r"^check_sub"))
     app.add_handler(CallbackQueryHandler(playlist_page_callback, pattern=r"^pl_(page|play|rem)_"))
 
-    # Audio message listener
     app.add_handler(MessageHandler(filters.AUDIO | filters.Document.AUDIO | filters.Document.FileExtension("mp3"), handle_audio_message))
 
     await app.initialize()
 
-    # Self-healing on startup: Auto-restores database if container was wiped
-    await auto_restore_on_boot(app.bot)
-
-    # Web Server for Status + Admin File Manager
+    # Lightweight Web server for health check pingers
     web_app = web.Application()
     web_app.router.add_get("/", web_index)
-    web_app.router.add_get("/admin", admin_files_page)
-    web_app.router.add_get("/admin/download", admin_download_file)
-    web_app.router.add_get("/admin/edit", admin_edit_file_get)
-    web_app.router.add_post("/admin/edit", admin_edit_file_post)
-    web_app.router.add_post("/admin/upload", admin_upload_file)
-
     runner = web.AppRunner(web_app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
-    logger.info(f"🚀 Web Server started on port {PORT}")
-    logger.info(f"🔒 Admin File Manager running at /admin with user '{WEB_ADMIN_USER}'")
+    logger.info(f"🚀 Health check server running on port {PORT}")
 
-    # Start Telegram Polling
     await app.start()
-    await app.updater.start_polling(
-        drop_pending_updates=False,
-        allowed_updates=Update.ALL_TYPES
-    )
+    await app.updater.start_polling(drop_pending_updates=False, allowed_updates=Update.ALL_TYPES)
     logger.info("🤖 Music Management Bot is actively polling!")
 
-    # Start Background Workers
     pinger_task = asyncio.create_task(keep_alive_pinger())
-    backup_task = asyncio.create_task(backup_scheduler_worker(app.bot))
 
-    # Graceful exit handling
     stop_signal = asyncio.Event()
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
@@ -1429,10 +901,8 @@ async def main():
 
     await stop_signal.wait()
 
-    # Cleanup
     logger.info("Shutting down bot...")
     pinger_task.cancel()
-    backup_task.cancel()
     await app.updater.stop()
     await app.stop()
     await app.shutdown()
