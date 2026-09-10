@@ -3,7 +3,6 @@ import re
 import signal
 import logging
 import asyncio
-import html
 from datetime import datetime
 from aiohttp import web
 import aiohttp
@@ -52,7 +51,7 @@ logger = logging.getLogger(__name__)
 BROADCAST_ACTIVE = False
 ADMIN_MODE_USERS = set()
 BOT_USERNAME = None
-db: AsyncClient = None  # Supabase async client instance
+db: AsyncClient = None
 
 
 # ─────────────────────────────────────────────
@@ -107,7 +106,7 @@ async def send_fsub_gate(message_or_query, pending_song_id: int | None = None, e
     retry_data = f"check_sub_{pending_song_id}" if pending_song_id else "check_sub"
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("📢 Join Music Channel", url=CHANNEL_URL)],
-        [InlineKeyboardButton("🔄 I've Joined / Try Again", callback_data=retry_data)]
+        [InlineKeyboardButton("🔄 I've Joined / Try Again", callback_data=retry_data, api_kwargs={"style": "primary"})]
     ])
     text = (
         "👋 <b>Welcome to the Music Hub!</b>\n\n"
@@ -140,138 +139,7 @@ async def is_user_registered(user_id: int) -> bool:
 
 
 # ─────────────────────────────────────────────
-# Channel Sync Engine (Recovers 200+ Songs)
-# ─────────────────────────────────────────────
-async def scanchannel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Scans a range of channel message IDs by forwarding each to the admin,
-    extracting track metadata/file_id to Supabase, and deleting the forwarded post.
-    Usage: /scanchannel <start_id> <end_id>
-    """
-    if update.effective_user.id != ADMIN_ID:
-        return
-
-    args = context.args
-    if len(args) < 2:
-        await update.message.reply_text(
-            "⚠️ <b>Usage:</b> <code>/scanchannel &lt;start_id&gt; &lt;end_id&gt;</code>\n"
-            "<i>Example: /scanchannel 1 350</i>\n\n"
-            "💡 Tip: Copy the message link of your oldest and newest channel post to find the IDs.",
-            parse_mode="HTML"
-        )
-        return
-
-    try:
-        start_id = int(args[0])
-        end_id = int(args[1])
-    except ValueError:
-        await update.message.reply_text("⚠️ Start and end IDs must be valid numbers.", parse_mode="HTML")
-        return
-
-    if start_id > end_id:
-        start_id, end_id = end_id, start_id
-
-    progress_msg = await update.message.reply_text(
-        f"🔍 <b>Starting Channel Sync...</b>\n"
-        f"Scanning messages #{start_id} to #{end_id}\n"
-        f"<i>Please wait, this will populate Supabase without spamming the chat...</i>",
-        parse_mode="HTML"
-    )
-
-    imported = 0
-    skipped = 0
-    errors = 0
-
-    for msg_id in range(start_id, end_id + 1):
-        try:
-            # Forward the message into admin DM to inspect audio metadata
-            fwd = await context.bot.forward_message(
-                chat_id=update.effective_chat.id,
-                from_chat_id=MUSIC_CHANNEL_ID,
-                message_id=msg_id
-            )
-
-            # Check if it has an audio or music document
-            audio = fwd.audio
-            doc = fwd.document
-            file_id = None
-            file_unique_id = None
-            artist = "Unknown Artist"
-            title = "Unknown Track"
-            duration = 0
-            album = None
-
-            if audio:
-                file_id = audio.file_id
-                file_unique_id = audio.file_unique_id
-                artist = audio.performer or "Unknown Artist"
-                title = audio.title or audio.file_name or "Track"
-                duration = audio.duration
-            elif doc and ((doc.mime_type and "audio" in doc.mime_type) or (doc.file_name and doc.file_name.lower().endswith(('.mp3', '.m4a', '.flac')))):
-                file_id = doc.file_id
-                file_unique_id = doc.file_unique_id
-                title = doc.file_name or "Track"
-
-            # Always clean up the forwarded message
-            await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=fwd.message_id)
-
-            if file_id and file_unique_id:
-                norm = normalize_key(artist, title)
-
-                # Check if already present
-                dup_check = await db.table("songs").select("id").eq("file_unique_id", file_unique_id).limit(1).execute()
-                if not dup_check.data:
-                    await db.table("songs").insert({
-                        "file_id": file_id,
-                        "file_unique_id": file_unique_id,
-                        "artist": artist,
-                        "title": title,
-                        "album": album,
-                        "duration": duration,
-                        "norm_key": norm,
-                        "status": "published",
-                        "channel_message_id": msg_id
-                    }).execute()
-                    imported += 1
-                else:
-                    skipped += 1
-            else:
-                skipped += 1
-
-        except BadRequest:
-            # Message was deleted or not found
-            errors += 1
-        except Exception as e:
-            logger.error(f"Error scanning message {msg_id}: {e}")
-            errors += 1
-
-        # Periodic progress update every 25 messages
-        if (msg_id - start_id) % 25 == 0:
-            try:
-                await progress_msg.edit_text(
-                    f"🔍 <b>Scanning in Progress...</b>\n"
-                    f"• Processing: {msg_id}/{end_id}\n"
-                    f"• Tracks Indexed: {imported}\n"
-                    f"• Non-audio/Duplicates: {skipped}",
-                    parse_mode="HTML"
-                )
-            except Exception:
-                pass
-
-        await asyncio.sleep(0.35)  # Respect Telegram API limits
-
-    await progress_msg.edit_text(
-        f"✅ <b>Channel Sync Completed!</b>\n\n"
-        f"• <b>New Tracks Indexed:</b> {imported}\n"
-        f"• <b>Skipped / Duplicates:</b> {skipped}\n"
-        f"• <b>Non-existent IDs:</b> {errors}\n\n"
-        f"All indexed tracks are now available for subscribers in <code>/playlist</code>!",
-        parse_mode="HTML"
-    )
-
-
-# ─────────────────────────────────────────────
-# Admin Mode & Session Handlers
+# Admin Mode & Recording Session Handlers
 # ─────────────────────────────────────────────
 async def adminmode_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -279,20 +147,19 @@ async def adminmode_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if update.effective_chat.type != "private":
-        await update.message.reply_text("⚠️ Send <code>/adminmode</code> in my private DM.", parse_mode="HTML")
+        await update.message.reply_text("⚠️ Please send <code>/adminmode</code> in my private DM.", parse_mode="HTML")
         return
 
     ADMIN_MODE_USERS.add(user.id)
     await update.message.reply_text(
-        "🛠️ <b>Admin Mode: Activated (Supabase Edition)</b>\n\n"
-        "• <code>/record &lt;genre&gt;</code> - Open recording session\n"
-        "• <b>Forward Songs Here</b> - Send tracks directly to DM or group\n"
-        "• <code>/skipall</code> - Skip all pending duplicate tracks\n"
-        "• <code>/scanchannel &lt;start&gt; &lt;end&gt;</code> - Recover/sync existing channel songs\n"
-        "• <code>/over</code> - Close session & start automatic publishing\n"
-        "• <code>/stopbroadcast</code> - Pause broadcast\n"
-        "• <code>/pin</code> - Reply to any message to post & pin it with 'Go listen'\n"
-        "• <code>/status</code> - View Supabase statistics\n"
+        "🛠️ <b>Admin Mode: Activated</b>\n\n"
+        "• <code>/record &lt;genre&gt;</code> - Open a recording session (e.g. <code>/record rnb</code>)\n"
+        "• <b>Forward Songs Here</b> - Send/forward tracks directly to this chat!\n"
+        "• <code>/skipall</code> - Skip all pending duplicate tracks at once\n"
+        "• <code>/over</code> - Close session & begin automatic publishing\n"
+        "• <code>/stopbroadcast</code> - Pause or stop publishing\n"
+        "• <code>/pin</code> - Reply to any message to post & pin it with a 'Go listen' button\n"
+        "• <code>/status</code> - View current batch & stats\n"
         "• <code>/adminmodeoff</code> - Exit admin mode",
         parse_mode="HTML"
     )
@@ -309,12 +176,11 @@ async def record_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     args = context.args
     if not args:
-        await update.message.reply_text("⚠️ Specify a genre. Example:\n<code>/record rnb</code>", parse_mode="HTML")
+        await update.message.reply_text("⚠️ Please specify a genre. Example:\n<code>/record rnb</code>", parse_mode="HTML")
         return
 
     genre = " ".join(args).replace('"', '').strip()
 
-    # Check for ongoing recording batch
     active = await db.table("batches").select("id, genre").eq("status", "recording").limit(1).execute()
     if active.data:
         cur = active.data[0]
@@ -332,7 +198,7 @@ async def record_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🎙️ <b>Recording Session #{batch_id} Started!</b>\n"
         f"• <b>Genre:</b> #{make_hashtag(genre)[1:]}\n\n"
         f"👉 Forward songs directly here or in the group.\n"
-        f"👉 Send <code>/skipall</code> to discard duplicates.\n"
+        f"👉 Send <code>/skipall</code> to skip duplicate tracks.\n"
         f"👉 Send <code>/over</code> when finished to begin channel broadcast.",
         parse_mode="HTML"
     )
@@ -352,7 +218,7 @@ async def over_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     active = await db.table("batches").select("*").eq("status", "recording").limit(1).execute()
     if not active.data:
-        await update.message.reply_text("ℹ️ No active recording session. Start with <code>/record &lt;genre&gt;</code>.", parse_mode="HTML")
+        await update.message.reply_text("ℹ️ No active recording session. Start one with <code>/record &lt;genre&gt;</code>.", parse_mode="HTML")
         return
 
     batch = active.data[0]
@@ -381,11 +247,11 @@ async def stopbroadcast_command(update: Update, context: ContextTypes.DEFAULT_TY
         return
 
     if not BROADCAST_ACTIVE:
-        await update.message.reply_text("ℹ️ No broadcast running.")
+        await update.message.reply_text("ℹ️ There is no broadcast running right now.")
         return
 
     BROADCAST_ACTIVE = False
-    await update.message.reply_text("🛑 <b>Broadcast stopping...</b> Remaining tracks stay queued.", parse_mode="HTML")
+    await update.message.reply_text("🛑 <b>Broadcast stopping...</b> Remaining tracks remain queued.", parse_mode="HTML")
 
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
@@ -399,7 +265,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     is_adm_mode = "🟢 Active" if update.effective_user.id in ADMIN_MODE_USERS else "⚪ Inactive"
 
     status_msg = (
-        f"⚙️ <b>Bot System Status (Supabase)</b>\n\n"
+        f"⚙️ <b>Bot System Status</b>\n\n"
         f"• <b>Admin Mode:</b> {is_adm_mode}\n"
         f"• <b>Active Broadcast:</b> {'🟢 Running' if BROADCAST_ACTIVE else '⚪ Idle'}\n"
         f"• <b>Music Channel:</b> <code>{MUSIC_CHANNEL_ID}</code> (@{CHANNEL_USERNAME})\n"
@@ -421,12 +287,12 @@ async def pin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     replied = update.message.reply_to_message
     if not replied:
-        await update.message.reply_text("⚠️ Reply to the message you want to post & pin in the channel with <code>/pin</code>.", parse_mode="HTML")
+        await update.message.reply_text("⚠️ Reply to any message you want to post and pin in the channel with <code>/pin</code>.", parse_mode="HTML")
         return
 
     bot_user = await get_bot_username(context.bot)
     listen_markup = InlineKeyboardMarkup([
-        [InlineKeyboardButton("🎧 Go listen", url=f"https://t.me/{bot_user}")]
+        [InlineKeyboardButton("🎧 Go listen", url=f"https://t.me/{bot_user}", api_kwargs={"style": "primary"})]
     ])
 
     try:
@@ -437,14 +303,14 @@ async def pin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=listen_markup
         )
         await context.bot.pin_chat_message(chat_id=MUSIC_CHANNEL_ID, message_id=sent_msg.message_id)
-        await update.message.reply_text("✅ Message successfully posted and pinned in channel!", parse_mode="HTML")
+        await update.message.reply_text("✅ Message successfully posted and pinned in the channel!", parse_mode="HTML")
     except Exception as e:
         logger.error(f"Error in /pin: {e}")
         await update.message.reply_text(f"❌ Error: {e}", parse_mode="HTML")
 
 
 # ─────────────────────────────────────────────
-# Audio Ingestion
+# Audio Ingestion & Duplicate Handling
 # ─────────────────────────────────────────────
 async def handle_audio_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
@@ -488,10 +354,8 @@ async def handle_audio_message(update: Update, context: ContextTypes.DEFAULT_TYP
     batch_id = active.data[0]["id"]
     norm = normalize_key(artist, title)
 
-    # Check for duplicates by normalized key or file unique ID
     existing = await db.table("songs").select("id, artist, title").or_(f"norm_key.eq.{norm},file_unique_id.eq.{file_unique_id}").neq("status", "skipped").limit(1).execute()
 
-    # Get max order_index
     order_res = await db.table("songs").select("order_index").eq("batch_id", batch_id).order("order_index", desc=True).limit(1).execute()
     next_order = (order_res.data[0]["order_index"] + 1) if order_res.data and order_res.data[0]["order_index"] else 1
 
@@ -512,8 +376,8 @@ async def handle_audio_message(update: Update, context: ContextTypes.DEFAULT_TYP
 
         buttons = [
             [
-                InlineKeyboardButton("🚫 Skip", callback_data=f"dup_skip_{song_id}"),
-                InlineKeyboardButton("⚠️ Record Anyway", callback_data=f"dup_keep_{song_id}"),
+                InlineKeyboardButton("🚫 Skip", callback_data=f"dup_skip_{song_id}", api_kwargs={"style": "danger"}),
+                InlineKeyboardButton("⚠️ Record Anyway", callback_data=f"dup_keep_{song_id}", api_kwargs={"style": "primary"}),
             ]
         ]
         await msg.reply_text(
@@ -575,7 +439,7 @@ async def broadcast_worker(app: Application, batch_id: int, genre: str, notify_c
         caption = generate_caption(artist=song["artist"], album=song["album"], genre=genre)
 
         channel_markup = InlineKeyboardMarkup([
-            [InlineKeyboardButton("➕ Add to Playlist", callback_data=f"pl_add_{song_id}")]
+            [InlineKeyboardButton("➕ Add to Playlist", callback_data=f"pl_add_{song_id}", api_kwargs={"style": "success"})]
         ])
 
         try:
@@ -617,7 +481,7 @@ async def broadcast_worker(app: Application, batch_id: int, genre: str, notify_c
 
 
 # ─────────────────────────────────────────────
-# Subscriber Playlist Handlers
+# Subscriber Playlist (10 Tracks Per Page & Styled Buttons)
 # ─────────────────────────────────────────────
 async def add_to_playlist_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -629,7 +493,6 @@ async def add_to_playlist_callback(update: Update, context: ContextTypes.DEFAULT
         await query.answer(url=f"https://t.me/{bot_user}?start=save_{song_id}")
         return
 
-    # Check if already added
     check = await db.table("user_playlists").select("song_id").eq("user_id", user.id).eq("song_id", song_id).limit(1).execute()
     if check.data:
         await query.answer("Already in your playlist! 🎧", show_alert=False)
@@ -686,10 +549,9 @@ async def user_playlist_command(update: Update, context: ContextTypes.DEFAULT_TY
     await render_playlist_page(update.message, user.id, page=1)
 
 async def render_playlist_page(message, user_id: int, page: int, edit=False):
-    limit = 5
+    limit = 10  # 10 songs per page
     offset = (page - 1) * limit
 
-    # Count total
     count_res = await db.table("user_playlists").select("song_id", count="exact").eq("user_id", user_id).execute()
     total = count_res.count or 0
 
@@ -701,12 +563,11 @@ async def render_playlist_page(message, user_id: int, page: int, edit=False):
             await message.reply_text(text, reply_markup=None, parse_mode="HTML")
         return
 
-    # Fetch tracks with joined metadata
     res = await db.table("user_playlists").select(
         "song_id, songs(id, artist, title, duration)"
     ).eq("user_id", user_id).order("added_at", desc=True).range(offset, offset + limit - 1).execute()
 
-    total_pages = (total + limit - 1) // limit
+    total_pages = max(1, (total + limit - 1) // limit)
     text = f"🎧 <b>Your Saved Playlist</b> (Page {page}/{total_pages})\n\n"
     keyboard = []
 
@@ -717,9 +578,11 @@ async def render_playlist_page(message, user_id: int, page: int, edit=False):
         artist = s["artist"] or "Unknown"
         title = s["title"] or "Track"
         text += f"• 🎵 <b>{artist}</b> - {title} <i>({format_duration(s['duration'])})</i>\n"
+        
+        # Blue Play button, Red Danger Remove button
         keyboard.append([
-            InlineKeyboardButton(f"▶️ Play {title[:16]}", callback_data=f"pl_play_{s['id']}"),
-            InlineKeyboardButton("❌ Remove", callback_data=f"pl_rem_{s['id']}_{page}")
+            InlineKeyboardButton(f"▶️ Play {title[:16]}", callback_data=f"pl_play_{s['id']}", api_kwargs={"style": "primary"}),
+            InlineKeyboardButton("❌ Remove", callback_data=f"pl_rem_{s['id']}_{page}", api_kwargs={"style": "danger"})
         ])
 
     nav = []
@@ -770,7 +633,7 @@ async def playlist_page_callback(update: Update, context: ContextTypes.DEFAULT_T
         await query.answer("Removed from playlist 🗑️")
 
         total = (await db.table("user_playlists").select("song_id", count="exact").eq("user_id", user_id).execute()).count or 0
-        limit = 5
+        limit = 10  # 10 songs per page
         max_page = max(1, (total + limit - 1) // limit)
         await render_playlist_page(query.message, user_id, min(page, max_page), edit=True)
 
@@ -790,8 +653,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             "👋 <b>Welcome Admin!</b>\n\n"
             "• <code>/adminmode</code> - Open admin control panel\n"
-            "• <code>/scanchannel &lt;start&gt; &lt;end&gt;</code> - Sync 200+ channel songs into Supabase\n"
-            "• <code>/playlist</code> - View personal playlist",
+            "• <code>/playlist</code> - View your saved music",
             parse_mode="HTML"
         )
         return
@@ -848,10 +710,9 @@ async def main():
         logger.error("TELEGRAM_TOKEN is missing!")
         return
     if not SUPABASE_KEY:
-        logger.error("SUPABASE_KEY is missing! Please set your service_role key.")
+        logger.error("SUPABASE_KEY is missing! Set your service_role key.")
         return
 
-    # Initialize Supabase client
     db = await create_async_client(SUPABASE_URL, SUPABASE_KEY)
     logger.info("✅ Connected to Supabase Cloud Database!")
 
@@ -863,7 +724,6 @@ async def main():
     app.add_handler(CommandHandler("adminmodeoff", adminmodeoff_command))
     app.add_handler(CommandHandler("record", record_command))
     app.add_handler(CommandHandler("skipall", skipall_command))
-    app.add_handler(CommandHandler("scanchannel", scanchannel_command))
     app.add_handler(CommandHandler("over", over_command))
     app.add_handler(CommandHandler("stopbroadcast", stopbroadcast_command))
     app.add_handler(CommandHandler("status", status_command))
@@ -879,7 +739,6 @@ async def main():
 
     await app.initialize()
 
-    # Lightweight Web server for health check pingers
     web_app = web.Application()
     web_app.router.add_get("/", web_index)
     runner = web.AppRunner(web_app)
