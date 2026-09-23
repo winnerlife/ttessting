@@ -1,14 +1,18 @@
 import os
 import re
+import html
+import time
 import signal
 import logging
 import asyncio
-from datetime import datetime
-from aiohttp import web
+from urllib.parse import urlparse
+
 import aiohttp
+import httpx
+from aiohttp import web
 from supabase import create_async_client, AsyncClient
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.error import BadRequest
+from telegram.error import BadRequest, NetworkError as TelegramNetworkError
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -21,13 +25,38 @@ from telegram.ext import (
 # ─────────────────────────────────────────────
 # Configuration & Constants
 # ─────────────────────────────────────────────
-BOT_TOKEN = os.environ.get("TELEGRAM_TOKEN")
+# Required env vars : TELEGRAM_TOKEN, SUPABASE_KEY (service_role key)
+# Recommended       : SUPABASE_URL (e.g. https://<project-ref>.supabase.co)
+# Optional          : PORT, APP_URL, ADMIN_ID, RECORDING_GROUP_ID, MUSIC_CHANNEL_ID,
+#                     DB_KEEPALIVE_SECONDS (default 21600 = 6 hours)
+
+def clean_supabase_url(raw: str | None) -> str:
+    """Normalise SUPABASE_URL: strip quotes/whitespace, force https://, drop /rest/v1 and trailing slash."""
+    url = (raw or "").strip().strip('"').strip("'").strip()
+    if url and not url.startswith(("http://", "https://")):
+        url = f"https://{url}"
+    url = url.rstrip("/")
+    for suffix in ("/rest/v1", "/rest"):
+        if url.endswith(suffix):
+            url = url[: -len(suffix)]
+    return url.rstrip("/")
+
+BOT_TOKEN = (os.environ.get("TELEGRAM_TOKEN") or "").strip()
 PORT = int(os.environ.get("PORT", "8080"))
-APP_URL = os.environ.get("APP_URL")
+APP_URL = (os.environ.get("APP_URL") or "").strip() or None
 
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "7429996344"))
-SUPABASE_URL = os.environ.get("SUPABASE_URL", "https://zrwbwtzduhgmtszzleot.supabase.co")
-SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
+SUPABASE_URL_FROM_ENV = "SUPABASE_URL" in os.environ
+SUPABASE_URL = clean_supabase_url(os.environ.get("SUPABASE_URL", "https://zrwbwtzduhgmtszzleot.supabase.co"))
+SUPABASE_KEY = (os.environ.get("SUPABASE_KEY") or "").strip()
+SUPABASE_HOST = urlparse(SUPABASE_URL).hostname or "(invalid URL)"
+
+# How often to run a tiny query so the free-tier project never looks inactive.
+# Supabase pauses free projects after ~7 days of low activity, so 6h is a safe margin.
+DB_KEEPALIVE_SECONDS = max(60, int(os.environ.get("DB_KEEPALIVE_SECONDS", "21600")))
+
+# Stop a broadcast after this many consecutive failures instead of looping forever.
+MAX_BROADCAST_ERRORS = 5
 
 def format_tg_id(raw_id: str | int) -> int:
     val = int(raw_id)
@@ -41,10 +70,37 @@ MUSIC_CHANNEL_ID = format_tg_id(os.environ.get("MUSIC_CHANNEL_ID", "-4448938519"
 CHANNEL_USERNAME = "Yourveryownplaylist"
 CHANNEL_URL = f"https://t.me/{CHANNEL_USERNAME}"
 
+
+# ─────────────────────────────────────────────
+# Logging (with secret redaction)
+# ─────────────────────────────────────────────
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
 )
+
+# httpx logs every request URL at INFO, and Telegram URLs contain the bot token.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+
+_TOKEN_RE = re.compile(r"bot\d+:[A-Za-z0-9_-]+")
+
+class RedactSecretsFilter(logging.Filter):
+    """Safety net: mask anything that looks like a Telegram bot token before it is written."""
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            msg = record.getMessage()
+            redacted = _TOKEN_RE.sub("bot<REDACTED>", msg)
+            if redacted != msg:
+                record.msg = redacted
+                record.args = ()
+        except Exception:
+            pass
+        return True
+
+for _handler in logging.getLogger().handlers:
+    _handler.addFilter(RedactSecretsFilter())
+
 logger = logging.getLogger(__name__)
 
 # Global Runtime State
@@ -52,6 +108,10 @@ BROADCAST_ACTIVE = False
 ADMIN_MODE_USERS = set()
 BOT_USERNAME = None
 db: AsyncClient = None
+BACKGROUND_TASKS: set[asyncio.Task] = set()
+_ALERT_TIMES: dict[str, float] = {}
+
+esc = html.escape
 
 
 # ─────────────────────────────────────────────
@@ -84,6 +144,39 @@ def is_recording_group(chat_id: int) -> bool:
     cid_str = str(chat_id)
     target_str = str(RECORDING_GROUP_ID).replace("-100", "-")
     return cid_str == str(RECORDING_GROUP_ID) or cid_str == target_str or cid_str.replace("-100", "-") == target_str
+
+def spawn_task(coro) -> asyncio.Task:
+    """create_task that keeps a strong reference (so it can't be garbage-collected) and logs crashes."""
+    task = asyncio.create_task(coro)
+    BACKGROUND_TASKS.add(task)
+
+    def _done(t: asyncio.Task):
+        BACKGROUND_TASKS.discard(t)
+        if not t.cancelled() and t.exception():
+            logger.error(f"Background task crashed: {t.exception()!r}")
+
+    task.add_done_callback(_done)
+    return task
+
+def is_db_connectivity_error(err: BaseException | None) -> bool:
+    """True for network-level failures talking to Supabase (DNS, refused, timeout)."""
+    return isinstance(err, httpx.TransportError)
+
+def is_dns_error(err: BaseException | None) -> bool:
+    text = str(err or "").lower()
+    return "name or service not known" in text or "name resolution" in text or "getaddrinfo" in text
+
+async def alert_admin(bot, key: str, text: str, cooldown: float = 1800):
+    """DM the admin, at most once per `cooldown` seconds for a given alert key."""
+    now = time.monotonic()
+    last = _ALERT_TIMES.get(key)
+    if last is not None and now - last < cooldown:
+        return
+    _ALERT_TIMES[key] = now
+    try:
+        await bot.send_message(chat_id=ADMIN_ID, text=text, parse_mode="HTML")
+    except Exception as e:
+        logger.warning(f"Could not alert admin ({key}): {e}")
 
 async def get_bot_username(bot) -> str:
     global BOT_USERNAME
@@ -121,6 +214,8 @@ async def send_fsub_gate(message_or_query, pending_song_id: int | None = None, e
         await message_or_query.reply_text(text, reply_markup=keyboard, parse_mode="HTML")
 
 async def register_user(user_id: int, username: str | None = None, first_name: str | None = None):
+    """Upsert the user. Logs and RE-RAISES on failure so callers never continue as if it worked;
+    the global error handler tells the user to try again."""
     try:
         await db.table("users").upsert({
             "user_id": user_id,
@@ -128,14 +223,99 @@ async def register_user(user_id: int, username: str | None = None, first_name: s
             "first_name": first_name
         }).execute()
     except Exception as e:
-        logger.error(f"Error registering user {user_id}: {e}")
+        logger.error(f"Error registering user {user_id}: {e!r}")
+        raise
 
 async def is_user_registered(user_id: int) -> bool:
+    """Returns True/False for a real answer. Database failures PROPAGATE (they are not 'not registered')."""
+    res = await db.table("users").select("user_id").eq("user_id", user_id).limit(1).execute()
+    return len(res.data) > 0
+
+
+# ─────────────────────────────────────────────
+# Database Health: startup check + keep-alive
+# ─────────────────────────────────────────────
+async def verify_db_connection(retries: int = 3) -> bool:
+    """create_async_client() makes no network call, so run a real query to prove the DB is reachable."""
+    for attempt in range(1, retries + 1):
+        try:
+            await db.table("users").select("user_id").limit(1).execute()
+            return True
+        except Exception as e:
+            logger.error(f"Database check {attempt}/{retries} failed: {e!r}")
+            if is_dns_error(e):
+                logger.error(
+                    f"Cannot resolve '{SUPABASE_HOST}'. Check that the Supabase project is not paused/deleted "
+                    f"and that SUPABASE_URL is correct."
+                )
+            if attempt < retries:
+                await asyncio.sleep(2 * attempt)
+    return False
+
+async def supabase_keepalive(app: Application):
+    """Runs a tiny query on a schedule so the free-tier project never looks inactive,
+    and DMs the admin when the database goes down / comes back."""
+    db_was_down = False
+    await asyncio.sleep(30)
+    while True:
+        try:
+            await db.table("users").select("user_id").limit(1).execute()
+            logger.info("💓 Supabase keep-alive query OK")
+            if db_was_down:
+                db_was_down = False
+                await alert_admin(app.bot, "db_recovered", "✅ <b>Database is reachable again.</b>", cooldown=0)
+        except Exception as e:
+            logger.error(f"Supabase keep-alive failed: {e!r}")
+            if not db_was_down:
+                db_was_down = True
+                hint = (
+                    "\nThe hostname could not be resolved. Check whether the Supabase project is paused."
+                    if is_dns_error(e) else ""
+                )
+                await alert_admin(
+                    app.bot, "db_down",
+                    f"🚨 <b>Database unreachable</b>\n<code>{esc(repr(e)[:300])}</code>{hint}",
+                    cooldown=0,
+                )
+        await asyncio.sleep(DB_KEEPALIVE_SECONDS)
+
+
+# ─────────────────────────────────────────────
+# Global Error Handler
+# ─────────────────────────────────────────────
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    err = context.error
+
+    # Telegram-side network blips (polling timeouts, etc.): log quietly, never spam users.
+    if isinstance(err, TelegramNetworkError):
+        logger.warning(f"Telegram network error: {err}")
+        return
+
+    db_down = is_db_connectivity_error(err)
+    if db_down:
+        logger.error(f"Database connection error: {err!r}")
+        await alert_admin(
+            context.bot, "db_error",
+            f"🚨 <b>Database connection error</b>\n<code>{esc(repr(err)[:300])}</code>",
+        )
+    else:
+        logger.error("Unhandled exception while handling an update", exc_info=(type(err), err, err.__traceback__))
+
+    if not isinstance(update, Update):
+        return
+
+    text = (
+        "⚠️ The service is temporarily unavailable. Please try again in a few minutes."
+        if db_down else
+        "⚠️ Something went wrong. Please try again."
+    )
     try:
-        res = await db.table("users").select("user_id").eq("user_id", user_id).limit(1).execute()
-        return len(res.data) > 0
-    except Exception:
-        return False
+        if update.callback_query:
+            await update.callback_query.answer(text, show_alert=True)
+        elif update.effective_message and update.effective_chat and update.effective_chat.type == "private":
+            await update.effective_message.reply_text(text)
+    except Exception as e:
+        logger.debug(f"Could not notify user about error: {e}")
 
 
 # ─────────────────────────────────────────────
@@ -185,7 +365,7 @@ async def record_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if active.data:
         cur = active.data[0]
         await update.message.reply_text(
-            f"⚠️ Batch #{cur['id']} (<b>{cur['genre']}</b>) is currently recording.\n"
+            f"⚠️ Batch #{cur['id']} (<b>{esc(str(cur['genre']))}</b>) is currently recording.\n"
             f"Send <code>/over</code> to finish it first.",
             parse_mode="HTML"
         )
@@ -196,7 +376,7 @@ async def record_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(
         f"🎙️ <b>Recording Session #{batch_id} Started!</b>\n"
-        f"• <b>Genre:</b> #{make_hashtag(genre)[1:]}\n\n"
+        f"• <b>Genre:</b> #{esc(make_hashtag(genre)[1:])}\n\n"
         f"👉 Forward songs directly here or in the group.\n"
         f"👉 Send <code>/skipall</code> to skip duplicate tracks.\n"
         f"👉 Send <code>/over</code> when finished to begin channel broadcast.",
@@ -239,7 +419,7 @@ async def over_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     BROADCAST_ACTIVE = True
-    asyncio.create_task(broadcast_worker(context.application, batch_id, genre, notify_chat_id=update.effective_chat.id))
+    spawn_task(broadcast_worker(context.application, batch_id, genre, notify_chat_id=update.effective_chat.id))
 
 async def stopbroadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global BROADCAST_ACTIVE
@@ -269,15 +449,17 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"• <b>Admin Mode:</b> {is_adm_mode}\n"
         f"• <b>Active Broadcast:</b> {'🟢 Running' if BROADCAST_ACTIVE else '⚪ Idle'}\n"
         f"• <b>Music Channel:</b> <code>{MUSIC_CHANNEL_ID}</code> (@{CHANNEL_USERNAME})\n"
+        f"• <b>Database:</b> <code>{esc(SUPABASE_HOST)}</code>\n"
         f"• <b>Total Songs in DB:</b> {total_songs}\n"
         f"• <b>Published Songs:</b> {published_songs}\n"
         f"• <b>Registered Users:</b> {total_users}\n\n"
     )
 
     if active_rec.data:
-        status_msg += f"🎙️ <b>Active Batch:</b> #{active_rec.data[0]['id']} (Genre: {active_rec.data[0]['genre']})"
+        status_msg += f"🎙️ <b>Active Batch:</b> #{active_rec.data[0]['id']} (Genre: {esc(str(active_rec.data[0]['genre']))})"
     else:
-        status_msg += "🎙️ <b>Active Batch:</b> None (Use /record <genre>)"
+        # NOTE: must be escaped, a raw <genre> breaks Telegram's HTML parser.
+        status_msg += "🎙️ <b>Active Batch:</b> None (Use /record &lt;genre&gt;)"
 
     await update.message.reply_text(status_msg, parse_mode="HTML")
 
@@ -306,7 +488,7 @@ async def pin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("✅ Message successfully posted and pinned in the channel!", parse_mode="HTML")
     except Exception as e:
         logger.error(f"Error in /pin: {e}")
-        await update.message.reply_text(f"❌ Error: {e}", parse_mode="HTML")
+        await update.message.reply_text(f"❌ Error: {esc(str(e))}", parse_mode="HTML")
 
 
 # ─────────────────────────────────────────────
@@ -382,7 +564,7 @@ async def handle_audio_message(update: Update, context: ContextTypes.DEFAULT_TYP
         ]
         await msg.reply_text(
             f"⚠️ <b>Duplicate Detected</b>\n"
-            f"🎵 <b>{artist} - {title}</b> already exists in DB.\n"
+            f"🎵 <b>{esc(artist)} - {esc(title)}</b> already exists in DB.\n"
             f"Action for track #{next_order} (or send <code>/skipall</code>):",
             reply_markup=InlineKeyboardMarkup(buttons),
             parse_mode="HTML"
@@ -428,56 +610,101 @@ async def broadcast_worker(app: Application, batch_id: int, genre: str, notify_c
     global BROADCAST_ACTIVE
     logger.info(f"Starting broadcast for Batch #{batch_id}")
     published_count = 0
+    errors_in_row = 0
+    final_status = "stopped"
+    warning = ""
 
-    while BROADCAST_ACTIVE:
-        res = await db.table("songs").select("*").eq("batch_id", batch_id).eq("status", "queued").order("order_index").limit(1).execute()
-        if not res.data:
-            break
+    try:
+        while BROADCAST_ACTIVE:
+            if errors_in_row >= MAX_BROADCAST_ERRORS:
+                logger.error(f"Batch #{batch_id}: {errors_in_row} consecutive errors, stopping broadcast.")
+                warning = f"⚠️ Stopped after {errors_in_row} consecutive errors. Check the logs, then resume."
+                break
 
-        song = res.data[0]
-        song_id = song["id"]
-        caption = generate_caption(artist=song["artist"], album=song["album"], genre=genre)
+            try:
+                res = await db.table("songs").select("*").eq("batch_id", batch_id).eq("status", "queued").order("order_index").limit(1).execute()
+            except Exception as e:
+                errors_in_row += 1
+                logger.error(f"Broadcast DB error (batch #{batch_id}): {e!r}")
+                await asyncio.sleep(10)
+                continue
 
-        channel_markup = InlineKeyboardMarkup([
-            [InlineKeyboardButton("➕ Add to Playlist", callback_data=f"pl_add_{song_id}", api_kwargs={"style": "success"})]
-        ])
+            if not res.data:
+                break
 
-        try:
-            sent_msg = await app.bot.send_audio(
-                chat_id=MUSIC_CHANNEL_ID,
-                audio=song["file_id"],
-                caption=caption,
-                parse_mode="HTML",
-                duration=song["duration"],
-                performer=song["artist"],
-                title=song["title"],
-                reply_markup=channel_markup
-            )
+            song = res.data[0]
+            song_id = song["id"]
+            caption = generate_caption(artist=song["artist"], album=song["album"], genre=genre)
 
-            await db.table("songs").update({
-                "status": "published",
-                "channel_message_id": sent_msg.message_id
-            }).eq("id", song_id).execute()
+            channel_markup = InlineKeyboardMarkup([
+                [InlineKeyboardButton("➕ Add to Playlist", callback_data=f"pl_add_{song_id}", api_kwargs={"style": "success"})]
+            ])
+
+            try:
+                sent_msg = await app.bot.send_audio(
+                    chat_id=MUSIC_CHANNEL_ID,
+                    audio=song["file_id"],
+                    caption=caption,
+                    parse_mode="HTML",
+                    duration=song["duration"],
+                    performer=song["artist"],
+                    title=song["title"],
+                    reply_markup=channel_markup
+                )
+            except Exception as e:
+                errors_in_row += 1
+                logger.error(f"Error publishing song #{song_id}: {e}")
+                await asyncio.sleep(5)
+                continue
 
             published_count += 1
+
+            # The song is already in the channel. Mark it published, retrying briefly; if the DB is down,
+            # halt instead of looping (a still-'queued' song would be posted to the channel again).
+            marked = False
+            for _ in range(3):
+                try:
+                    await db.table("songs").update({
+                        "status": "published",
+                        "channel_message_id": sent_msg.message_id
+                    }).eq("id", song_id).execute()
+                    marked = True
+                    break
+                except Exception as e:
+                    logger.error(f"Could not mark song #{song_id} as published: {e!r}")
+                    await asyncio.sleep(5)
+
+            if not marked:
+                warning = (
+                    f"⚠️ Song #{song_id} was posted but could not be marked as published (database error). "
+                    f"Broadcast halted to avoid posting it twice. Fix it manually before resuming."
+                )
+                break
+
+            errors_in_row = 0
             await asyncio.sleep(2.5)
 
+        try:
+            remaining = await db.table("songs").select("id").eq("batch_id", batch_id).eq("status", "queued").limit(1).execute()
+            final_status = "stopped" if remaining.data else "completed"
+            await db.table("batches").update({"status": final_status}).eq("id", batch_id).execute()
         except Exception as e:
-            logger.error(f"Error publishing song #{song_id}: {e}")
-            await asyncio.sleep(5)
+            logger.error(f"Could not finalise batch #{batch_id}: {e!r}")
+            final_status = "unknown (database error)"
+    finally:
+        BROADCAST_ACTIVE = False
 
-    remaining = await db.table("songs").select("id").eq("batch_id", batch_id).eq("status", "queued").limit(1).execute()
-    final_status = "stopped" if remaining.data else "completed"
-    await db.table("batches").update({"status": final_status}).eq("id", batch_id).execute()
-
-    BROADCAST_ACTIVE = False
-    await app.bot.send_message(
-        chat_id=notify_chat_id,
-        text=f"🏁 <b>Broadcast finished for Batch #{batch_id}!</b>\n"
-             f"• <b>Published:</b> {published_count} tracks\n"
-             f"• <b>Status:</b> <i>{final_status}</i>",
-        parse_mode="HTML"
-    )
+    try:
+        await app.bot.send_message(
+            chat_id=notify_chat_id,
+            text=f"🏁 <b>Broadcast finished for Batch #{batch_id}!</b>\n"
+                 f"• <b>Published:</b> {published_count} tracks\n"
+                 f"• <b>Status:</b> <i>{esc(final_status)}</i>"
+                 + (f"\n\n{esc(warning)}" if warning else ""),
+            parse_mode="HTML"
+        )
+    except Exception as e:
+        logger.error(f"Could not send broadcast summary: {e}")
 
 
 # ─────────────────────────────────────────────
@@ -523,7 +750,7 @@ async def check_sub_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if pending_song_id:
         await db.table("user_playlists").upsert({"user_id": user.id, "song_id": pending_song_id}).execute()
         song_data = await db.table("songs").select("artist, title").eq("id", pending_song_id).limit(1).execute()
-        info = f"<b>{song_data.data[0]['artist']} - {song_data.data[0]['title']}</b>" if song_data.data else "the track"
+        info = f"<b>{esc(song_data.data[0]['artist'])} - {esc(song_data.data[0]['title'])}</b>" if song_data.data else "the track"
         await query.edit_message_text(
             f"🎉 <b>Welcome!</b>\n\n✅ Saved {info} to your playlist!\nSend <code>/playlist</code> to stream.",
             parse_mode="HTML"
@@ -548,6 +775,17 @@ async def user_playlist_command(update: Update, context: ContextTypes.DEFAULT_TY
 
     await render_playlist_page(update.message, user.id, page=1)
 
+async def _send_or_edit(message, text: str, reply_markup, edit: bool):
+    if edit:
+        try:
+            await message.edit_text(text, reply_markup=reply_markup, parse_mode="HTML")
+        except BadRequest as e:
+            # Happens when the page is re-rendered with identical content; harmless.
+            if "message is not modified" not in str(e).lower():
+                raise
+    else:
+        await message.reply_text(text, reply_markup=reply_markup, parse_mode="HTML")
+
 async def render_playlist_page(message, user_id: int, page: int, edit=False):
     limit = 10  # 10 songs per page
     offset = (page - 1) * limit
@@ -557,10 +795,7 @@ async def render_playlist_page(message, user_id: int, page: int, edit=False):
 
     if total == 0:
         text = "🎧 <b>Your playlist is empty!</b>\n\nTap <b>Add to Playlist</b> under any song in our channel to save it."
-        if edit:
-            await message.edit_text(text, reply_markup=None, parse_mode="HTML")
-        else:
-            await message.reply_text(text, reply_markup=None, parse_mode="HTML")
+        await _send_or_edit(message, text, None, edit)
         return
 
     res = await db.table("user_playlists").select(
@@ -577,8 +812,8 @@ async def render_playlist_page(message, user_id: int, page: int, edit=False):
             continue
         artist = s["artist"] or "Unknown"
         title = s["title"] or "Track"
-        text += f"• 🎵 <b>{artist}</b> - {title} <i>({format_duration(s['duration'])})</i>\n"
-        
+        text += f"• 🎵 <b>{esc(artist)}</b> - {esc(title)} <i>({format_duration(s['duration'])})</i>\n"
+
         # Blue Play button, Red Danger Remove button
         keyboard.append([
             InlineKeyboardButton(f"▶️ Play {title[:16]}", callback_data=f"pl_play_{s['id']}", api_kwargs={"style": "primary"}),
@@ -593,11 +828,7 @@ async def render_playlist_page(message, user_id: int, page: int, edit=False):
     if nav:
         keyboard.append(nav)
 
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    if edit:
-        await message.edit_text(text, reply_markup=reply_markup, parse_mode="HTML")
-    else:
-        await message.reply_text(text, reply_markup=reply_markup, parse_mode="HTML")
+    await _send_or_edit(message, text, InlineKeyboardMarkup(keyboard), edit)
 
 async def playlist_page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -667,7 +898,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if pending_song_id:
         await db.table("user_playlists").upsert({"user_id": user.id, "song_id": pending_song_id}).execute()
         song = await db.table("songs").select("artist, title").eq("id", pending_song_id).limit(1).execute()
-        info = f"<b>{song.data[0]['artist']} - {song.data[0]['title']}</b>" if song.data else "the song"
+        info = f"<b>{esc(song.data[0]['artist'])} - {esc(song.data[0]['title'])}</b>" if song.data else "the song"
         await update.message.reply_text(
             f"🎉 <b>Welcome!</b>\n\n✅ Added {info} to your playlist.\nSend <code>/playlist</code> to stream.",
             parse_mode="HTML"
@@ -689,12 +920,15 @@ async def web_index(request):
     )
 
 async def keep_alive_pinger():
+    """Pings the bot's own web server so the HOST doesn't sleep.
+    (This does NOT touch Supabase, see supabase_keepalive() for that.)"""
     await asyncio.sleep(15)
     target_url = APP_URL or f"http://127.0.0.1:{PORT}/"
+    timeout = aiohttp.ClientTimeout(total=10)
     async with aiohttp.ClientSession() as session:
         while True:
             try:
-                async with session.get(target_url, timeout=10) as resp:
+                async with session.get(target_url, timeout=timeout) as resp:
                     logger.info(f"💓 Keep-alive ping sent (HTTP {resp.status})")
             except Exception as e:
                 logger.warning(f"Keep-alive ping notice: {e}")
@@ -708,15 +942,34 @@ async def main():
     global db
     if not BOT_TOKEN:
         logger.error("TELEGRAM_TOKEN is missing!")
-        return
+        raise SystemExit(1)
     if not SUPABASE_KEY:
         logger.error("SUPABASE_KEY is missing! Set your service_role key.")
-        return
+        raise SystemExit(1)
+    if not SUPABASE_URL:
+        logger.error("SUPABASE_URL is empty or invalid!")
+        raise SystemExit(1)
+
+    if not SUPABASE_URL_FROM_ENV:
+        logger.warning("SUPABASE_URL env var is not set, using the hardcoded default. Set it explicitly in your deployment.")
+    logger.info(f"Supabase host: {SUPABASE_HOST}")
 
     db = await create_async_client(SUPABASE_URL, SUPABASE_KEY)
-    logger.info("✅ Connected to Supabase Cloud Database!")
+
+    # create_async_client() makes no network request, so prove the database is really reachable.
+    if not await verify_db_connection():
+        logger.critical(
+            f"Database is unreachable at {SUPABASE_HOST}. If this is a free-tier project, "
+            f"it may be paused: open the Supabase dashboard and click 'Resume project'. "
+            f"Also double-check the SUPABASE_URL env var."
+        )
+        raise SystemExit(1)
+    logger.info("✅ Supabase database is reachable.")
 
     app = Application.builder().token(BOT_TOKEN).build()
+
+    # Global error handler (logs, tells users, alerts the admin on DB outages)
+    app.add_error_handler(error_handler)
 
     # Handlers
     app.add_handler(CommandHandler("start", start_command))
@@ -752,6 +1005,7 @@ async def main():
     logger.info("🤖 Music Management Bot is actively polling!")
 
     pinger_task = asyncio.create_task(keep_alive_pinger())
+    db_keepalive_task = asyncio.create_task(supabase_keepalive(app))
 
     stop_signal = asyncio.Event()
     loop = asyncio.get_running_loop()
@@ -762,6 +1016,7 @@ async def main():
 
     logger.info("Shutting down bot...")
     pinger_task.cancel()
+    db_keepalive_task.cancel()
     await app.updater.stop()
     await app.stop()
     await app.shutdown()
